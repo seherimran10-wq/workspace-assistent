@@ -6,6 +6,7 @@
 <title>Workspace Assistant | AI Agentic System</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
   :root{
     --bg:#0A0C0F;
@@ -198,9 +199,10 @@
         <span style="margin-left:10px;color:var(--dim);font-size:0.75rem;">system.status</span>
       </div>
       <div class="console-body" id="statusConsole">
-        <div class="console-line"><span>Gmail</span><span class="status status-on">CONNECTED</span></div>
-        <div class="console-line"><span>Calendar</span><span class="status status-on">CONNECTED</span></div>
-        <div class="console-line"><span>Drive &amp; Docs</span><span class="status status-on">CONNECTED</span></div>
+        <div class="console-line toggleable" id="googleConnectRow"><span>Google Account <span class="console-hint" id="googleHint">(click to connect)</span></span><span class="status status-idle" id="googleStatus">NOT CONNECTED</span></div>
+        <div class="console-line"><span>Gmail</span><span class="status status-idle" id="gmailStatus">DEMO DATA</span></div>
+        <div class="console-line"><span>Calendar</span><span class="status status-idle" id="calStatus">DEMO DATA</span></div>
+        <div class="console-line"><span>Drive &amp; Docs</span><span class="status status-idle" id="driveStatus">DEMO DATA</span></div>
         <div class="console-line"><span>Gemini Hub</span><span class="status status-on" id="hubStatus">ACTIVE</span></div>
         <div class="console-line toggleable" id="autoReplyRow"><span>Auto-Reply Mode <span class="console-hint">(click to toggle)</span></span><span class="status status-idle" id="autoReplyStatus">STANDBY</span></div>
         <div class="console-line"><span>Notification Center</span><span class="status status-on" id="notifCountStatus">LISTENING</span></div>
@@ -261,7 +263,7 @@
     <div class="eyebrow" style="text-align:center;">Get This Built</div>
     <h2 style="margin-bottom:24px;">Want your own workspace assistant?</h2>
     <div class="demo-note">
-      <strong>This is a working demo, not just a mockup.</strong> Try a request above — it runs through a real reasoning + confirm-before-act pipeline against sample Gmail, Calendar and Drive data. The same approach can be built around your own tools, whether that's Gmail and Calendar or a completely different stack.
+      <strong>This is a working demo, not just a mockup.</strong> Try a request above — it runs through a real reasoning + confirm-before-act pipeline. By default it uses sample Gmail, Calendar and Drive data; click "Google Account" in the status panel at the top to sign in and connect your <em>real</em> Gmail, Calendar and Drive — replies you send and events you book from the module panels will be genuine. The same approach can be built around your own tools, whether that's Gmail and Calendar or a completely different stack.
     </div>
     <div class="btnrow" style="justify-content:center;margin-top:24px;">
       <a class="btn btn-primary" href="https://seherstudio.vercel.app/contact.html">Request This Build</a>
@@ -291,8 +293,17 @@
 
 <script>
 (function(){
+  var GOOGLE_CLIENT_ID = '118202641770-jjr3c788jvgo5sf9a3oib8s9a5ltjr8u.apps.googleusercontent.com';
+  var GOOGLE_SCOPES = [
+    'https://www.googleapis.com/auth/gmail.readonly',
+    'https://www.googleapis.com/auth/gmail.send',
+    'https://www.googleapis.com/auth/calendar.events',
+    'https://www.googleapis.com/auth/drive.readonly'
+  ].join(' ');
+
   var state = {
     autoReply: 'STANDBY',
+    google: { connected: false, accessToken: null, email: null, tokenClient: null },
     emails: [
       {id:1, from:'Alex Rivera', subject:'Proposal timeline check-in', preview:'Just following up on the revised timeline for the proposal...', replied:false},
       {id:2, from:'Priya Nair', subject:'Q3 budget numbers', preview:'Can you confirm the Q3 marketing spend before Friday?', replied:false},
@@ -327,6 +338,156 @@
     document.getElementById('notifCountStatus').textContent = state.notifications.length ? (state.notifications.length + ' LOGGED') : 'LISTENING';
   }
 
+  // ---- Google OAuth + live API integration ----
+  var googleConnectRow = document.getElementById('googleConnectRow');
+  var googleStatus = document.getElementById('googleStatus');
+  var googleHint = document.getElementById('googleHint');
+  var gmailStatus = document.getElementById('gmailStatus');
+  var calStatus = document.getElementById('calStatus');
+  var driveStatusEl = document.getElementById('driveStatus');
+
+  function setDataSourceLabels(){
+    var connected = state.google.connected;
+    [gmailStatus, calStatus, driveStatusEl].forEach(function(el){
+      el.textContent = connected ? 'LIVE' : 'DEMO DATA';
+      el.className = 'status ' + (connected ? 'status-on' : 'status-idle');
+    });
+  }
+  setDataSourceLabels();
+
+  function renderGoogleStatus(){
+    if (state.google.connected){
+      googleStatus.textContent = state.google.email || 'CONNECTED';
+      googleStatus.className = 'status status-on';
+      googleHint.textContent = '(click to disconnect)';
+    } else {
+      googleStatus.textContent = 'NOT CONNECTED';
+      googleStatus.className = 'status status-idle';
+      googleHint.textContent = '(click to connect)';
+    }
+    setDataSourceLabels();
+  }
+
+  function gapiFetch(url, opts){
+    opts = opts || {};
+    opts.headers = Object.assign({}, opts.headers, {Authorization: 'Bearer ' + state.google.accessToken});
+    return fetch(url, opts).then(function(res){
+      if (!res.ok) return res.text().then(function(t){ throw new Error('Google API error ' + res.status + ': ' + t); });
+      return res.json();
+    });
+  }
+
+  function base64UrlEncode(str){
+    return btoa(unescape(encodeURIComponent(str))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+  }
+
+  async function fetchGoogleProfileAndData(){
+    try {
+      var profile = await gapiFetch('https://gmail.googleapis.com/gmail/v1/users/me/profile');
+      state.google.email = profile.emailAddress;
+      renderGoogleStatus();
+      pushNotif('Connected Google account: ' + profile.emailAddress);
+      pushLog('Authenticated with Google as ' + profile.emailAddress + '. Live Gmail, Calendar and Drive access enabled.');
+      await Promise.all([refreshGmailInbox(), refreshCalendarEvents()]);
+      if (openMod) openModule(openMod);
+    } catch(e){
+      console.error(e);
+      toastError('Could not load your Google data: ' + e.message);
+    }
+  }
+
+  async function refreshGmailInbox(){
+    var list = await gapiFetch('https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=5&labelIds=INBOX&q=in:inbox');
+    var ids = (list.messages || []).map(function(m){ return m.id; });
+    var details = await Promise.all(ids.map(function(id){
+      return gapiFetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/' + id + '?format=metadata&metadataHeaders=From&metadataHeaders=Subject');
+    }));
+    state.emails = details.map(function(d){
+      var headers = (d.payload && d.payload.headers) || [];
+      var from = (headers.find(function(h){ return h.name === 'From'; }) || {}).value || 'Unknown sender';
+      var subject = (headers.find(function(h){ return h.name === 'Subject'; }) || {}).value || '(no subject)';
+      return {id: d.id, threadId: d.threadId, from: from.replace(/<.*>/,'').trim(), fromFull: from, subject: subject, preview: d.snippet || '', replied: false};
+    });
+  }
+
+  async function sendGmailReply(email, replyText){
+    var to = (email.fromFull.match(/<(.+)>/) || [null, email.fromFull])[1];
+    var subject = email.subject.indexOf('Re:') === 0 ? email.subject : 'Re: ' + email.subject;
+    var raw = 'To: ' + to + '\r\nSubject: ' + subject + '\r\nContent-Type: text/plain; charset="UTF-8"\r\n\r\n' + replyText;
+    return gapiFetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({raw: base64UrlEncode(raw), threadId: email.threadId})
+    });
+  }
+
+  async function refreshCalendarEvents(){
+    var timeMin = new Date().toISOString();
+    var data = await gapiFetch('https://www.googleapis.com/calendar/v3/calendars/primary/events?maxResults=5&orderBy=startTime&singleEvents=true&timeMin=' + encodeURIComponent(timeMin));
+    state.events = (data.items || []).map(function(ev){
+      var start = ev.start.dateTime || ev.start.date;
+      return {id: ev.id, title: ev.summary || '(no title)', time: new Date(start).toLocaleString([], {weekday:'short', hour:'2-digit', minute:'2-digit'})};
+    });
+  }
+
+  async function createCalendarEvent(title, startISO, endISO){
+    return gapiFetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({summary: title, start: {dateTime: startISO}, end: {dateTime: endISO}})
+    });
+  }
+
+  async function searchDriveFiles(query){
+    var q = "name contains '" + query.replace(/'/g,"\\'") + "' and trashed=false";
+    var data = await gapiFetch('https://www.googleapis.com/drive/v3/files?pageSize=8&fields=files(id,name,webViewLink,mimeType)&q=' + encodeURIComponent(q));
+    return data.files || [];
+  }
+
+  function toastError(msg){
+    var t = document.createElement('div');
+    t.textContent = msg;
+    t.style.cssText = 'position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#2a0f12;border:1px solid var(--red);color:var(--red);padding:12px 20px;border-radius:8px;font-family:JetBrains Mono,monospace;font-size:0.8rem;z-index:300;max-width:80vw;';
+    document.body.appendChild(t);
+    setTimeout(function(){ t.remove(); }, 4000);
+  }
+
+  function disconnectGoogle(){
+    if (state.google.accessToken && window.google && google.accounts && google.accounts.oauth2){
+      google.accounts.oauth2.revoke(state.google.accessToken, function(){});
+    }
+    state.google = { connected: false, accessToken: null, email: null, tokenClient: state.google.tokenClient };
+    renderGoogleStatus();
+    pushNotif('Disconnected Google account — back to demo data.');
+    if (openMod) openModule(openMod);
+  }
+
+  function connectGoogle(){
+    if (!window.google || !google.accounts || !google.accounts.oauth2){
+      toastError('Google sign-in script did not load — check your connection and reload.');
+      return;
+    }
+    if (!state.google.tokenClient){
+      state.google.tokenClient = google.accounts.oauth2.initTokenClient({
+        client_id: GOOGLE_CLIENT_ID,
+        scope: GOOGLE_SCOPES,
+        callback: function(resp){
+          if (resp.error){ toastError('Google sign-in failed: ' + resp.error); return; }
+          state.google.accessToken = resp.access_token;
+          state.google.connected = true;
+          renderGoogleStatus();
+          fetchGoogleProfileAndData();
+        }
+      });
+    }
+    state.google.tokenClient.requestAccessToken({prompt: state.google.email ? '' : 'consent'});
+  }
+
+  googleConnectRow.addEventListener('click', function(){
+    if (state.google.connected) disconnectGoogle(); else connectGoogle();
+  });
+  renderGoogleStatus();
+
   // ---- Auto-Reply toggle ----
   var autoReplyRow = document.getElementById('autoReplyRow');
   var autoReplyStatus = document.getElementById('autoReplyStatus');
@@ -349,26 +510,39 @@
   var openMod = null;
 
   function renderGmailPanel(){
+    var connected = state.google.connected;
+    var labelText = connected ? ('Live inbox — ' + state.google.email) : 'Inbox — 3 recent (demo data)';
+    var connectHint = connected ? '' : '<button class="mini-btn" id="gmailConnectBtn" style="margin-bottom:12px;">Connect Google to use your real inbox</button>';
     var html = state.emails.map(function(e){
       return '<div class="mail-item"><div><div class="mail-from">'+e.from+'</div><div class="mail-subj">'+e.subject+' — '+e.preview+'</div></div>' +
         (e.replied ? '<span class="replied-tag">✓ Replied</span>' : '<button class="mini-btn" data-email="'+e.id+'">Draft &amp; Send Reply</button>') +
         '</div>';
-    }).join('');
-    panel.innerHTML = '<div class="label" style="font-family:\'JetBrains Mono\',monospace;font-size:0.7rem;color:var(--dim);text-transform:uppercase;margin-bottom:10px;">Inbox — 3 recent</div>' + html;
+    }).join('') || '<div class="empty-log">No inbox messages found.</div>';
+    panel.innerHTML = connectHint + '<div class="label" style="font-family:\'JetBrains Mono\',monospace;font-size:0.7rem;color:var(--dim);text-transform:uppercase;margin-bottom:10px;">'+labelText+'</div>' + html;
+    var connectBtn = document.getElementById('gmailConnectBtn');
+    if (connectBtn) connectBtn.addEventListener('click', connectGoogle);
     panel.querySelectorAll('[data-email]').forEach(function(btn){
       btn.addEventListener('click', function(){
-        var id = parseInt(btn.dataset.email);
-        var email = state.emails.find(function(e){ return e.id === id; });
+        var id = btn.dataset.email;
+        var email = state.emails.find(function(e){ return String(e.id) === id; });
+        var replyText = 'Thanks for the note — looking into this now and will follow up shortly.';
         runPipeline({
           module:'gmail',
           inputText: 'Draft reply to ' + email.from + ' — "' + email.subject + '"',
           reasonText: 'Classified as Gmail request. Drafting a reply in your voice based on: "' + email.preview + '"',
-          confirmText: 'Send reply to ' + email.from + ': "Thanks for the note — looking into this now and will follow up shortly."',
+          confirmText: (connected ? 'Really send' : 'Send') + ' reply to ' + email.from + ': "' + replyText + '"' + (connected ? ' (this will actually send from your Gmail account).' : '.'),
           skipConfirmIfAutoReply: true,
           act: function(){
-            email.replied = true;
-            pushNotif('Replied to ' + email.from + ' — "' + email.subject + '"');
-            renderGmailPanel();
+            var afterAct = function(){
+              email.replied = true;
+              pushNotif((connected ? 'Sent real reply' : 'Replied') + ' to ' + email.from + ' — "' + email.subject + '"');
+              renderGmailPanel();
+            };
+            if (connected){
+              sendGmailReply(email, replyText).then(afterAct).catch(function(e){ toastError('Send failed: ' + e.message); });
+            } else {
+              afterAct();
+            }
           }
         });
       });
@@ -376,48 +550,105 @@
   }
 
   function renderCalendarPanel(){
+    var connected = state.google.connected;
+    var labelText = connected ? ('Live upcoming events — ' + state.google.email) : 'Upcoming (demo data)';
+    var connectHint = connected ? '' : '<button class="mini-btn" id="calConnectBtn" style="margin-bottom:12px;">Connect Google to use your real calendar</button>';
     var html = state.events.map(function(ev){
       return '<div class="cal-item"><div><div class="mail-from">'+ev.title+'</div><div class="mail-subj">'+ev.time+'</div></div><span class="replied-tag">✓ Booked</span></div>';
     }).join('') || '<div class="empty-log">No events yet.</div>';
-    panel.innerHTML = '<div class="label" style="font-family:\'JetBrains Mono\',monospace;font-size:0.7rem;color:var(--dim);text-transform:uppercase;margin-bottom:10px;">Upcoming</div>' + html +
-      '<div class="add-row"><input id="calTitle" placeholder="Event title"><input id="calTime" placeholder="e.g. Thu · 3:00 PM" style="max-width:180px;"><button class="btn btn-primary" id="calAdd" style="padding:9px 18px;font-size:0.78rem;">Book</button></div>';
+    var dtInputs = connected
+      ? '<div class="add-row"><input id="calTitle" placeholder="Event title"><input id="calStart" type="datetime-local" style="max-width:220px;"><button class="btn btn-primary" id="calAdd" style="padding:9px 18px;font-size:0.78rem;">Book</button></div>'
+      : '<div class="add-row"><input id="calTitle" placeholder="Event title"><input id="calTime" placeholder="e.g. Thu · 3:00 PM" style="max-width:180px;"><button class="btn btn-primary" id="calAdd" style="padding:9px 18px;font-size:0.78rem;">Book</button></div>';
+    panel.innerHTML = connectHint + '<div class="label" style="font-family:\'JetBrains Mono\',monospace;font-size:0.7rem;color:var(--dim);text-transform:uppercase;margin-bottom:10px;">'+labelText+'</div>' + html + dtInputs;
+    var connectBtn = document.getElementById('calConnectBtn');
+    if (connectBtn) connectBtn.addEventListener('click', connectGoogle);
     document.getElementById('calAdd').addEventListener('click', function(){
       var title = document.getElementById('calTitle').value.trim();
-      var time = document.getElementById('calTime').value.trim() || 'TBD';
       if (!title) return;
+      var timeLabel, startISO, endISO;
+      if (connected){
+        var startVal = document.getElementById('calStart').value;
+        if (!startVal) return;
+        var start = new Date(startVal);
+        var end = new Date(start.getTime() + 30*60000);
+        startISO = start.toISOString();
+        endISO = end.toISOString();
+        timeLabel = start.toLocaleString([], {weekday:'short', hour:'2-digit', minute:'2-digit'});
+      } else {
+        timeLabel = document.getElementById('calTime').value.trim() || 'TBD';
+      }
       runPipeline({
         module:'calendar',
-        inputText: 'Book "' + title + '" (' + time + ')',
+        inputText: 'Book "' + title + '" (' + timeLabel + ')',
         reasonText: 'Classified as Calendar request. Checking for conflicts, none found.',
-        confirmText: 'Add "' + title + '" to the calendar at ' + time + '.',
+        confirmText: (connected ? 'Really add' : 'Add') + ' "' + title + '" to ' + (connected ? 'your real Google Calendar' : 'the calendar') + ' at ' + timeLabel + '.',
         act: function(){
-          state.events.push({id: Date.now(), title: title, time: time});
-          pushNotif('Booked "' + title + '" — ' + time);
-          renderCalendarPanel();
+          var afterAct = function(id){
+            state.events.push({id: id || Date.now(), title: title, time: timeLabel});
+            pushNotif((connected ? 'Booked (live) ' : 'Booked ') + '"' + title + '" — ' + timeLabel);
+            renderCalendarPanel();
+          };
+          if (connected){
+            createCalendarEvent(title, startISO, endISO).then(function(ev){ afterAct(ev.id); }).catch(function(e){ toastError('Booking failed: ' + e.message); });
+          } else {
+            afterAct();
+          }
         }
       });
     });
   }
 
   function renderDrivePanel(){
-    panel.innerHTML = '<input id="driveSearch" placeholder="Search files..." style="width:100%;background:var(--bg);border:1px solid var(--line);color:var(--ink);padding:11px 14px;border-radius:4px;font-family:\'JetBrains Mono\',monospace;font-size:0.8rem;margin-bottom:14px;">' +
+    var connected = state.google.connected;
+    var connectHint = connected ? '' : '<button class="mini-btn" id="driveConnectBtn" style="margin-bottom:12px;">Connect Google to search your real Drive</button>';
+    panel.innerHTML = connectHint + '<input id="driveSearch" placeholder="Search files..." style="width:100%;background:var(--bg);border:1px solid var(--line);color:var(--ink);padding:11px 14px;border-radius:4px;font-family:\'JetBrains Mono\',monospace;font-size:0.8rem;margin-bottom:14px;">' +
       '<div id="driveResults"></div>';
-    function renderResults(q){
-      var list = state.files.filter(function(f){ return !q || f.name.toLowerCase().indexOf(q.toLowerCase()) > -1; });
-      document.getElementById('driveResults').innerHTML = list.map(function(f){
-        return '<div class="file-item"><div><div class="mail-from">'+f.name+'</div><div class="mail-subj">'+f.snippet+'</div></div><button class="mini-btn" data-file="'+f.id+'">Open</button></div>';
-      }).join('') || '<div class="empty-log">No files match.</div>';
-      document.querySelectorAll('[data-file]').forEach(function(btn){
+    var connectBtn = document.getElementById('driveConnectBtn');
+    if (connectBtn) connectBtn.addEventListener('click', connectGoogle);
+
+    function bindOpenButtons(getFileById){
+      panel.querySelectorAll('[data-file]').forEach(function(btn){
         btn.addEventListener('click', function(){
-          var f = state.files.find(function(x){ return x.id === parseInt(btn.dataset.file); });
+          var f = getFileById(btn.dataset.file);
+          if (!f) return;
           pushLog('Opened "' + f.name + '" via Drive & Docs module.');
           pushNotif('Opened "' + f.name + '"');
+          if (f.webViewLink) window.open(f.webViewLink, '_blank');
           if (openMod === 'gemini') renderGeminiPanel();
         });
       });
     }
-    renderResults('');
-    document.getElementById('driveSearch').addEventListener('input', function(e){ renderResults(e.target.value); });
+
+    function renderMockResults(q){
+      var list = state.files.filter(function(f){ return !q || f.name.toLowerCase().indexOf(q.toLowerCase()) > -1; });
+      document.getElementById('driveResults').innerHTML = list.map(function(f){
+        return '<div class="file-item"><div><div class="mail-from">'+f.name+'</div><div class="mail-subj">'+f.snippet+'</div></div><button class="mini-btn" data-file="'+f.id+'">Open</button></div>';
+      }).join('') || '<div class="empty-log">No files match.</div>';
+      bindOpenButtons(function(id){ return state.files.find(function(x){ return x.id === parseInt(id); }); });
+    }
+
+    var liveResults = [];
+    var searchTimer = null;
+    function renderLiveResults(q){
+      var resultsEl = document.getElementById('driveResults');
+      if (!q){ resultsEl.innerHTML = '<div class="empty-log">Type to search your real Drive files.</div>'; return; }
+      resultsEl.innerHTML = '<div class="empty-log">Searching…</div>';
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(function(){
+        searchDriveFiles(q).then(function(files){
+          liveResults = files;
+          resultsEl.innerHTML = files.map(function(f){
+            return '<div class="file-item"><div><div class="mail-from">'+f.name+'</div><div class="mail-subj">'+(f.mimeType||'')+'</div></div><button class="mini-btn" data-file="'+f.id+'">Open</button></div>';
+          }).join('') || '<div class="empty-log">No files match.</div>';
+          bindOpenButtons(function(id){ return liveResults.find(function(x){ return x.id === id; }); });
+        }).catch(function(e){ resultsEl.innerHTML = '<div class="empty-log">Search failed: '+e.message+'</div>'; });
+      }, 400);
+    }
+
+    if (connected){ renderLiveResults(''); } else { renderMockResults(''); }
+    document.getElementById('driveSearch').addEventListener('input', function(e){
+      if (connected) renderLiveResults(e.target.value); else renderMockResults(e.target.value);
+    });
   }
 
   function renderGeminiPanel(){
@@ -529,32 +760,34 @@
 
   function runFreeText(text){
     var mod = classify(text);
+    var simNote = state.google.connected ? ' (simulated routing — use the module buttons above to actually send/book/open with your connected account)' : '';
     if (mod === 'gmail') {
       var email = state.emails.find(function(e){ return !e.replied; }) || state.emails[0];
+      if (!email){ pushNotif('No inbox messages to reply to.'); return; }
       runPipeline({
         module:'gmail',
         inputText: text,
         reasonText: 'Classified as a Gmail request. Matched to thread from ' + email.from + '.',
-        confirmText: 'Send reply to ' + email.from + ' regarding "' + email.subject + '".',
+        confirmText: 'Send reply to ' + email.from + ' regarding "' + email.subject + '".' + simNote,
         skipConfirmIfAutoReply: true,
-        act: function(){ email.replied = true; pushNotif('Replied to ' + email.from + ' via free-text request'); if (openMod==='gmail') renderGmailPanel(); }
+        act: function(){ email.replied = true; pushNotif('Replied to ' + email.from + ' via free-text request (simulated)'); if (openMod==='gmail') renderGmailPanel(); }
       });
     } else if (mod === 'calendar') {
       runPipeline({
         module:'calendar',
         inputText: text,
         reasonText: 'Classified as a Calendar request. No conflicts found in the target window.',
-        confirmText: 'Add this event to the calendar based on: "' + text + '".',
-        act: function(){ state.events.push({id:Date.now(), title:text, time:'This week'}); pushNotif('Booked event from request: "' + text + '"'); if (openMod==='calendar') renderCalendarPanel(); }
+        confirmText: 'Add this event to the calendar based on: "' + text + '".' + simNote,
+        act: function(){ state.events.push({id:Date.now(), title:text, time:'This week'}); pushNotif('Booked event from request: "' + text + '" (simulated)'); if (openMod==='calendar') renderCalendarPanel(); }
       });
     } else if (mod === 'drive') {
-      var file = state.files[Math.floor(Math.random()*state.files.length)];
+      var file = state.files[Math.floor(Math.random()*state.files.length)] || {name:'(no demo files)'};
       runPipeline({
         module:'drive',
         inputText: text,
         reasonText: 'Classified as a Drive request. Best match: "' + file.name + '".',
-        confirmText: 'Open and summarize "' + file.name + '" for you.',
-        act: function(){ pushNotif('Found & opened "' + file.name + '" via request'); if (openMod==='drive') renderDrivePanel(); }
+        confirmText: 'Open and summarize "' + file.name + '" for you.' + simNote,
+        act: function(){ pushNotif('Found & opened "' + file.name + '" via request (simulated)'); if (openMod==='drive') renderDrivePanel(); }
       });
     } else {
       runPipeline({
