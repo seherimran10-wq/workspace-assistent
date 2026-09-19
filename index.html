@@ -284,6 +284,7 @@
       <input class="draft-field" id="draftSubject" type="text" placeholder="Subject">
       <div class="label" style="margin-top:14px;">Message</div>
       <textarea class="draft-field" id="draftBody" rows="9"></textarea>
+      <div id="draftWhy" style="margin-top:12px;font-size:0.76rem;color:var(--green);line-height:1.5;" hidden></div>
       <div id="draftHint" style="margin-top:10px;font-size:0.76rem;color:var(--dim);">Edit anything above, then press Send. Nothing is sent until you do.</div>
     </div>
     <div class="modal-actions">
@@ -820,6 +821,9 @@
     document.getElementById('draftTo').textContent = em.label;
     subj.value = em.subject;
     bodyEl.value = em.body;
+    var whyEl = document.getElementById('draftWhy');
+    whyEl.textContent = em.why ? 'Why this draft: ' + em.why : '';
+    whyEl.hidden = !em.why;
 
     function refresh(){
       var empty = !subj.value.trim() && (!bodyEl.value.trim() || bodyEl.value === BLANK_BODY);
@@ -841,6 +845,97 @@
     }
   }
 
+  // ---- Smart drafting: past conversation + calendar + Claude ----
+  function b64urlToText(data){
+    var s = data.replace(/-/g, '+').replace(/_/g, '/');
+    while (s.length % 4) s += '=';
+    try { return decodeURIComponent(escape(atob(s))); } catch(e){ return ''; }
+  }
+
+  function messageText(payload){
+    if (!payload) return '';
+    if (payload.mimeType === 'text/plain' && payload.body && payload.body.data) return b64urlToText(payload.body.data);
+    var parts = payload.parts || [];
+    for (var i = 0; i < parts.length; i++){
+      var t = messageText(parts[i]);
+      if (t) return t;
+    }
+    return '';
+  }
+
+  function stripQuoted(text){
+    var cut = text.search(/\n\s*On .{5,120} wrote:/);
+    if (cut > 0) text = text.slice(0, cut);
+    return text.split('\n').filter(function(l){ return l.trim().charAt(0) !== '>'; }).join('\n').trim();
+  }
+
+  function headerOf(msg, name){
+    var h = ((msg.payload && msg.payload.headers) || []).find(function(x){ return x.name.toLowerCase() === name.toLowerCase(); });
+    return h ? h.value : '';
+  }
+
+  function fetchHistoryWith(addr){
+    var q = 'from:' + addr + ' OR to:' + addr;
+    return gapiFetch('https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=8&q=' + encodeURIComponent(q)).then(function(list){
+      var ids = (list.messages || []).map(function(m){ return m.id; });
+      return Promise.all(ids.map(function(id){
+        return gapiFetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/' + id + '?format=full');
+      }));
+    }).then(function(msgs){
+      return msgs.map(function(m){
+        var from = headerOf(m, 'From');
+        return {
+          from: from.toLowerCase().indexOf(addr.toLowerCase()) > -1 ? 'them' : 'me',
+          date: headerOf(m, 'Date'),
+          subject: headerOf(m, 'Subject'),
+          text: stripQuoted(messageText(m.payload) || m.snippet || ''),
+          ts: Number(m.internalDate) || 0
+        };
+      }).sort(function(a, b){ return a.ts - b.ts; });
+    });
+  }
+
+  function fetchUpcomingEvents(){
+    var now = new Date();
+    var max = new Date(now.getTime() + 10 * 24 * 3600 * 1000);
+    var url = 'https://www.googleapis.com/calendar/v3/calendars/primary/events?maxResults=30&orderBy=startTime&singleEvents=true&timeMin=' +
+      encodeURIComponent(now.toISOString()) + '&timeMax=' + encodeURIComponent(max.toISOString());
+    return gapiFetch(url).then(function(data){
+      return (data.items || []).map(function(ev){
+        return {
+          title: ev.summary || '(no title)',
+          start: (ev.start && (ev.start.dateTime || ev.start.date)) || '',
+          end: (ev.end && (ev.end.dateTime || ev.end.date)) || '',
+          location: ev.location || ''
+        };
+      });
+    });
+  }
+
+  function requestAiDraft(text, em, history, events){
+    return fetch('/api/draft', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        token: state.google.accessToken,
+        request: text,
+        to: em.to,
+        history: history.map(function(h){ return {from: h.from, date: h.date, subject: h.subject, text: h.text}; }),
+        events: events,
+        now: new Date().toString(),
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        userEmail: state.google.email
+      })
+    }).then(function(res){
+      if (!res.ok) return res.json().catch(function(){ return {}; }).then(function(j){
+        var err = new Error(j.error || ('status ' + res.status));
+        err.code = j.error;
+        throw err;
+      });
+      return res.json();
+    });
+  }
+
   function runSendEmail(text, em){
     resetPipeline();
     setStep(1, text);
@@ -851,9 +946,33 @@
         toastError('Connect your Google account to send email.');
         return;
       }
+      setStep(2, 'Reading your past emails with ' + em.to + ' and your calendar for the next 10 days…');
+      Promise.all([
+        fetchHistoryWith(em.to).catch(function(){ return []; }),
+        fetchUpcomingEvents().catch(function(){ return []; })
+      ]).then(function(ctx){
+        var history = ctx[0], events = ctx[1];
+        return requestAiDraft(text, em, history, events).then(function(d){
+          em.subject = d.subject || '';
+          em.body = d.body || '';
+          em.blank = d.blank === true || (!em.subject && !em.body);
+          if (em.blank){ em.subject = ''; em.body = BLANK_BODY; }
+          em.why = 'Read ' + history.length + ' past email' + (history.length === 1 ? '' : 's') + ' with ' + em.to +
+            ' and ' + events.length + ' upcoming calendar event' + (events.length === 1 ? '' : 's') + '. ' + (d.why || '');
+        }).catch(function(e){
+          em.why = '';
+          toastError(e.code === 'not_configured'
+            ? 'Smart drafting isn\'t switched on yet — showing a basic draft instead.'
+            : 'Couldn\'t generate a smart draft — showing a basic one instead.');
+        });
+      }).then(function(){
+        proceedToDraft();
+      });
+
+      function proceedToDraft(){
       setStep(2, em.blank
-        ? 'Got the recipient (' + em.label + ') but no subject or message — opened a blank draft for you to write.'
-        : 'Drafted an email to ' + em.label + ' with subject "' + em.subject + '". Review it before it sends.');
+        ? 'Got the recipient (' + em.label + ') but nothing to base a draft on — opened a blank draft for you to write.'
+        : (em.why || ('Drafted an email to ' + em.label + ' with subject "' + em.subject + '".')) + ' Review it before it sends.');
       pushLog('Drafted email to ' + em.label);
       setTimeout(function(){
         setStep(3, 'Waiting for you to review and send the draft...');
@@ -872,6 +991,7 @@
           pushNotif('Cancelled draft email to ' + em.to);
         });
       }, 500);
+      }
     }, 400);
   }
 
