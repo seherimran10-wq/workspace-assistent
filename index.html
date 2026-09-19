@@ -149,6 +149,7 @@
   .modal-box{width:100%;max-width:460px;background:var(--panel);border:1px solid var(--green);border-radius:8px;overflow:hidden;box-shadow:0 20px 60px -10px rgba(0,0,0,0.6);}
   .modal-head{background:#0D1116;padding:14px 18px;border-bottom:1px solid var(--line);font-family:'JetBrains Mono',monospace;font-size:0.78rem;color:var(--green);display:flex;justify-content:space-between;align-items:center;}
   .modal-body{padding:22px;font-size:0.9rem;color:var(--ink);line-height:1.6;}
+  #modalText{white-space:pre-wrap;}
   .modal-body .label{font-family:'JetBrains Mono',monospace;font-size:0.7rem;color:var(--dim);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px;}
   .modal-actions{display:flex;gap:10px;padding:0 22px 22px;}
   .modal-actions .btn{flex:1;text-align:center;}
@@ -728,6 +729,82 @@
     }, 550);
   }
 
+  async function sendGmailMessage(to, subject, body){
+    var raw = 'To: ' + to + '\r\nSubject: ' + subject + '\r\nContent-Type: text/plain; charset="UTF-8"\r\n\r\n' + body;
+    return gapiFetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({raw: base64UrlEncode(raw)})
+    });
+  }
+
+  function capitalize(s){ return s.charAt(0).toUpperCase() + s.slice(1); }
+
+  // Understands "send an email to bob@x.com about the invoice" and
+  // "email Alex saying the files are ready". Returns null if the text isn't
+  // a send-email request, or {error} / {to, subject, body} otherwise.
+  function parseSendEmail(text){
+    if (!/\b(e-?mail|mail)\b/i.test(text)) return null;
+    if (!/\b(send|write|compose|draft|shoot|drop)\b/i.test(text) && !/^\s*e-?mail\b/i.test(text)) return null;
+    var addr = text.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/);
+    var rest = addr ? text.replace(addr[0], ' ') : text;
+    var to = addr ? addr[0] : null;
+    var label = to;
+
+    if (!to){
+      var nm = rest.match(/\bto\s+(.+?)(?:\s+(?:about|regarding|re|saying|that|telling|asking)\b|$)/i);
+      var name = nm ? nm[1].trim().toLowerCase() : '';
+      var known = state.emails.find(function(e){ return name && e.fromFull && e.fromFull.toLowerCase().indexOf(name) > -1; });
+      if (known){
+        to = (known.fromFull.match(/<(.+)>/) || [null, known.fromFull])[1];
+        label = known.from + ' <' + to + '>';
+      } else {
+        return {error: name
+          ? 'I can\'t find an email address for "' + name + '" — type their full address (e.g. name@example.com).'
+          : 'Who should it go to? Include their full email address (e.g. name@example.com).'};
+      }
+    }
+
+    var message = rest.match(/\b(?:saying|say|that|telling (?:them|him|her)|asking)\s+(.+)$/i);
+    var topic = rest.match(/\b(?:about|regarding|re|on)\s+(.+?)(?:\s+(?:saying|that|telling|asking)\b|$)/i);
+    var subject, body;
+    if (message){
+      body = capitalize(message[1].trim());
+      subject = topic ? capitalize(topic[1].trim()) : capitalize(message[1].trim().split(/\s+/).slice(0, 6).join(' '));
+    } else if (topic){
+      subject = capitalize(topic[1].trim());
+      body = 'Hi,\n\nI wanted to reach out regarding ' + topic[1].trim() + '.\n\nBest regards';
+    } else {
+      return {error: 'What should the email say? Add something like "about the invoice" or "saying the files are ready".'};
+    }
+    if (message) body = 'Hi,\n\n' + body + '\n\nBest regards';
+    return {to: to, label: label, subject: subject, body: body};
+  }
+
+  function runSendEmail(text, em){
+    resetPipeline();
+    setStep(1, text);
+    setTimeout(function(){
+      if (em.error){ setStep(2, em.error); return; }
+      if (!state.google.connected){
+        setStep(2, 'Connect your Google account first (click "Google Account" in the status panel) — then I can send this for real.');
+        toastError('Connect your Google account to send email.');
+        return;
+      }
+      runPipeline({
+        module:'gmail',
+        inputText: text,
+        reasonText: 'Drafted an email to ' + em.label + ' with subject "' + em.subject + '".',
+        confirmText: 'Send this email from your Gmail account?\n\nTo: ' + em.label + '\nSubject: ' + em.subject + '\n\n' + em.body,
+        act: function(){
+          sendGmailMessage(em.to, em.subject, em.body).then(function(){
+            pushNotif('Sent email to ' + em.to + ' — "' + em.subject + '"');
+          }).catch(function(e){ toastError('Send failed: ' + e.message); });
+        }
+      });
+    }, 400);
+  }
+
   function classify(text){
     var t = text.toLowerCase();
     if (/reply|email|inbox|message/.test(t)) return 'gmail';
@@ -737,6 +814,8 @@
   }
 
   function runFreeText(text){
+    var em = parseSendEmail(text);
+    if (em) return runSendEmail(text, em);
     var mod = classify(text);
     var simNote = state.google.connected ? ' (simulated routing — use the module buttons above to actually send/book/open with your connected account)' : '';
     if (mod === 'gmail') {
