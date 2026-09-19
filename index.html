@@ -980,35 +980,237 @@
     });
   }
 
-  function postToAi(payload){
-    return ensureToken().then(function(){
-      payload.token = state.google.accessToken;
-      payload.now = new Date().toString();
-      payload.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-      payload.userEmail = state.google.email;
-      return fetch('/api/draft', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(payload)
-      });
-    }).then(function(res){
-      if (!res.ok) return res.json().catch(function(){ return {}; }).then(function(j){
-        var err = new Error(j.error || ('status ' + res.status));
-        err.code = j.error;
-        throw err;
-      });
-      return res.json();
-    });
+  // ---- Local drafting engine: no AI service, everything runs in your browser ----
+  var WEEKDAYS = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
+  var MONTH_RE = '(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)';
+  var MONTHS = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
+  var SCHED_RE = /\b(meet|meeting|call|catch[- ]?up|sync|lunch|dinner|coffee|visit|chat|talk|appointment|discuss|demo|schedule|zoom|interview|get together)\b/i;
+
+  function addDays(d, n){ var x = new Date(d.getFullYear(), d.getMonth(), d.getDate() + n); return x; }
+  function esc(s){ return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+  // Finds a date and/or time in free text ("Thursday at 3pm", "tomorrow", "24 sep").
+  // Returns {date, hh, mm, used[]} or null.
+  function parseWhen(text, now){
+    var t = text.toLowerCase(), used = [], m, date = null, hh = null, mm = 0;
+    var base = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    var explicitDate = true;
+    if ((m = t.match(/\bday after tomorrow\b/))){ date = addDays(base, 2); used.push(m[0]); }
+    else if ((m = t.match(/\btomorrow\b/))){ date = addDays(base, 1); used.push(m[0]); }
+    else if ((m = t.match(/\b(?:today|tonight)\b/))){ date = base; used.push(m[0]); }
+    else if ((m = t.match(/\bin (\d{1,2}) days?\b/))){ date = addDays(base, +m[1]); used.push(m[0]); }
+    else if ((m = t.match(/\b(?:(?:next|this|on)\s+)?(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/))){
+      var diff = (WEEKDAYS.indexOf(m[1]) - base.getDay() + 7) % 7;
+      date = addDays(base, diff === 0 ? 7 : diff); used.push(m[0]);
+    }
+    else if ((m = t.match(/\bnext week\b/))){ date = addDays(base, (8 - base.getDay()) % 7 || 7); used.push(m[0]); }
+    else if ((m = t.match(new RegExp('\\b(\\d{1,2})(?:st|nd|rd|th)?\\s+(?:of\\s+)?' + MONTH_RE + '\\b')))){
+      date = new Date(base.getFullYear(), MONTHS.indexOf(m[2].slice(0, 3)), +m[1]); used.push(m[0]);
+    }
+    else if ((m = t.match(new RegExp('\\b' + MONTH_RE + '\\.?\\s+(\\d{1,2})(?:st|nd|rd|th)?\\b')))){
+      date = new Date(base.getFullYear(), MONTHS.indexOf(m[1].slice(0, 3)), +m[2]); used.push(m[0]);
+    }
+    else explicitDate = false;
+    if (date && date < base) date = new Date(date.getFullYear() + 1, date.getMonth(), date.getDate());
+
+    if ((m = t.match(/\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)/))){
+      hh = (+m[1] % 12) + (m[3].charAt(0) === 'p' ? 12 : 0); mm = +(m[2] || 0); used.push(m[0]);
+    } else if ((m = t.match(/\b(?:at\s+)?([01]?\d|2[0-3]):([0-5]\d)\b/))){
+      hh = +m[1]; mm = +m[2]; used.push(m[0]);
+    } else if ((m = t.match(/\bat\s+(\d{1,2})\b/))){
+      var n = +m[1]; hh = (n >= 1 && n <= 7) ? n + 12 : n; used.push(m[0]);
+    } else if ((m = t.match(/\b(?:noon|midday)\b/))){ hh = 12; used.push(m[0]); }
+    if (hh !== null && hh > 23) hh = null;
+
+    if (!date && hh === null) return null;
+    if (!date){
+      date = base;
+      var c = new Date(base); c.setHours(hh, mm, 0, 0);
+      if (c <= now) date = addDays(base, 1);
+    }
+    return {date: date, hh: hh, mm: mm, used: used, explicitDate: explicitDate};
   }
 
-  function requestAiDraft(text, em, history, events, style){
-    return postToAi({
-      request: text,
-      to: em.to,
-      history: history.map(function(h){ return {from: h.from, date: h.date, subject: h.subject, text: h.text}; }),
-      styleSamples: style || [],
-      events: events
+  function parseDuration(text){
+    var m = text.match(/\bfor\s+(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m)\b/i);
+    if (m){ var v = parseFloat(m[1]); return {min: /^h/i.test(m[2]) ? Math.round(v * 60) : Math.round(v), used: m[0]}; }
+    if ((m = text.match(/\bfor\s+(?:an?\s+)?hour\b/i))) return {min: 60, used: m[0]};
+    if ((m = text.match(/\bfor\s+half an hour\b/i))) return {min: 30, used: m[0]};
+    return null;
+  }
+
+  function busyIntervals(events){
+    return events.filter(function(e){ return e.start && e.start.length > 10; }).map(function(e){
+      return {s: new Date(e.start).getTime(), e: new Date(e.end || e.start).getTime(), title: e.title};
     });
+  }
+  function overlapWith(busy, s, e, buffer){
+    return busy.find(function(b){ return s < b.e + buffer && e > b.s - buffer; });
+  }
+
+  // Free slots (weekdays, 9:00-18:00, 30-minute buffer around other events).
+  function findSlots(events, now, durMin, count, day){
+    var busy = busyIntervals(events), out = [], hours = [10, 11, 14, 15, 16, 9, 13, 17];
+    var base = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    var days = day ? [day] : [0,1,2,3,4,5,6,7,8,9].map(function(i){ return addDays(base, i); });
+    days.forEach(function(d){
+      if (out.length >= count && !day) return;
+      if (!day && (d.getDay() === 0 || d.getDay() === 6)) return;
+      var found = 0;
+      hours.forEach(function(h){
+        if (found >= (day ? count : 1) || out.length >= count) return;
+        var s = new Date(d); s.setHours(h, 0, 0, 0);
+        var e = new Date(s.getTime() + durMin * 60000);
+        if (s.getTime() < now.getTime() + 3600000) return;
+        if (e.getHours() * 60 + e.getMinutes() > 18 * 60 || e.getDate() !== s.getDate()) return;
+        if (overlapWith(busy, s.getTime(), e.getTime(), 30 * 60000)) return;
+        out.push(s); found++;
+      });
+    });
+    return out.sort(function(a, b){ return a - b; });
+  }
+
+  function fmtSlot(d){
+    var tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    return d.toLocaleDateString([], {weekday:'long', day:'numeric', month:'long'}) + ' at ' +
+      d.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'}) + ' (' + tz + ')';
+  }
+
+  function sentence(s){
+    s = capitalize(s.trim());
+    return /[.!?]$/.test(s) ? s : s + '.';
+  }
+
+  function extractParts(text){
+    var message = text.match(/\b(?:saying|say|that|telling (?:them|him|her)|asking)\s+(.+)$/i);
+    var topic = text.match(/\b(?:about|regarding|re)\s+(.+?)(?:\s+(?:saying|that|telling|asking)\b|$)/i);
+    return {message: message ? message[1].trim() : '', topic: topic ? topic[1].trim() : ''};
+  }
+
+  // Greeting and sign-off copied from the user's own sent emails.
+  function learnStyle(mine){
+    var gc = {}, sc = {}, names = {};
+    mine.forEach(function(t){
+      var lines = t.split('\n').map(function(l){ return l.trim(); }).filter(Boolean);
+      var g = (lines[0] || '').match(/^(hi|hello|hey|dear|good (?:morning|afternoon|evening)|greetings)\b/i);
+      if (g){ var k = capitalize(g[1].toLowerCase()); gc[k] = (gc[k] || 0) + 1; }
+      for (var i = lines.length - 1; i >= Math.max(0, lines.length - 4); i--){
+        if (/^(best regards|kind regards|warm regards|regards|best wishes|best|thanks|thank you|many thanks|cheers|sincerely|yours sincerely|yours truly|cordially)[,!.]?$/i.test(lines[i])){
+          var s = lines[i].replace(/[,!.]$/, ''); sc[s] = (sc[s] || 0) + 1;
+          if (lines[i + 1] && lines[i + 1].length <= 30 && !/@|http/.test(lines[i + 1])) names[lines[i + 1]] = (names[lines[i + 1]] || 0) + 1;
+          break;
+        }
+      }
+    });
+    function top(o){ return Object.keys(o).sort(function(a, b){ return o[b] - o[a]; })[0]; }
+    var sign = top(sc), nm = top(names);
+    return {
+      greeting: top(gc) || 'Hi',
+      signoff: sign ? sign + ',' + (nm ? '\n' + nm : '') : 'Best regards',
+      learned: mine.length > 0 && (!!top(gc) || !!sign)
+    };
+  }
+
+  function firstNameOf(label, addr){
+    var disp = (label || '').replace(/<.*>/, '').replace(/["']/g, '').trim();
+    if (disp && disp.indexOf('@') === -1) return capitalize(disp.split(/\s+/)[0]);
+    var local = (addr || '').split('@')[0];
+    if (/^(info|admin|support|sales|hello|contact|team|office|mail|noreply|no-reply|accounts|billing|hr|enquiries|inquiries)$/i.test(local)) return '';
+    var tok = local.split(/[._\-+]/)[0].replace(/\d+/g, '');
+    return tok.length > 1 ? capitalize(tok) : '';
+  }
+
+  // Builds {subject, body, why, blank} from your instruction, past emails and calendar.
+  function composeLocal(text, em, history, events, styleSamples){
+    var now = new Date();
+    var parts = extractParts(text.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+/, ' '));
+    var when = parseWhen(text, now);
+    var sched = SCHED_RE.test(text);
+    var mine = history.filter(function(h){ return h.from === 'me' && h.text; }).map(function(h){ return h.text; })
+      .concat((styleSamples || []).map(function(s){ return s.text; }));
+    var style = learnStyle(mine);
+    var last = history.length ? history[history.length - 1] : null;
+    var isNew = history.length === 0 && !em.reply;
+    var latestSubject = last ? (last.subject || '').replace(/^((re|fwd?):\s*)+/i, '').trim() : '';
+    var topic = parts.topic;
+    if (topic && when) when.used.forEach(function(u){ topic = topic.replace(new RegExp(esc(u), 'i'), ' '); });
+    topic = topic.replace(/\s+/g, ' ').replace(/^(?:on|at|for|the)\s+(?=\S)/i, function(x){ return x.toLowerCase() === 'the ' ? x : ''; }).trim();
+    if (/^(on|at|for|by|in|to)$/i.test(topic)) topic = '';
+    var msg = parts.message ? sentence(parts.message) : '';
+    var name = firstNameOf(em.label, em.to);
+    var used = [];
+
+    if (!msg && !topic && !sched && isNew && !em.reply){
+      return {subject: '', body: '', blank: true, why: 'New contact and nothing to base a draft on.'};
+    }
+
+    var lines = [name ? style.greeting + ' ' + name + ',' : 'Hello,', ''];
+
+    // Opening line
+    if (em.reply) lines.push('Thanks for your email' + ((topic || latestSubject) ? ' about "' + (topic || latestSubject) + '"' : '') + '.');
+    else if (isNew) lines.push('I hope you are well.');
+    else if (last.from === 'them') lines.push('Thanks for your last message' + (latestSubject ? ' about "' + latestSubject + '"' : '') + '.');
+    else lines.push('I hope you are doing well.');
+
+    // Purpose
+    var kindMatch = text.match(/\b(meeting|meet|call|catch[- ]?up|lunch|dinner|coffee|visit|chat|talk|appointment|demo|interview|zoom|sync)\b/i);
+    var kindMap = {meet:'a meeting', meeting:'a meeting', call:'a call', lunch:'lunch', dinner:'dinner', coffee:'coffee', visit:'a visit', chat:'a chat', talk:'a chat', appointment:'an appointment', demo:'a demo', interview:'an interview', zoom:'a video call', sync:'a sync'};
+    var kind = kindMatch ? (kindMap[kindMatch[1].toLowerCase().replace(/[- ]/g, '')] || (/catch/i.test(kindMatch[1]) ? 'a catch-up' : 'a time to talk')) : 'a time to talk';
+    if (msg) lines.push(msg);
+    else if (sched && topic && SCHED_RE.test(topic)) lines.push('I would like to arrange ' + topic + '.');
+    else if (sched) lines.push('I would like to set up ' + kind + (topic ? ' about ' + topic : '') + '.');
+    else if (topic && !em.reply) lines.push('I am writing about ' + topic + '.');
+    else if (!em.reply && last) lines.push('I wanted to follow up on ' + (latestSubject ? '"' + latestSubject + '"' : 'our last conversation') + ' and see where things stand.');
+    else if (em.reply) lines.push('');
+
+    // Scheduling: real free slots from the calendar
+    var eventCount = events.length;
+    if (sched){
+      var dur = (parseDuration(text) || {}).min || (/\b(meeting|lunch|dinner|interview|appointment)\b/i.test(text) ? 60 : 30);
+      var proposed = [], conflictNote = '';
+      if (when && when.hh !== null){
+        var s = new Date(when.date); s.setHours(when.hh, when.mm, 0, 0);
+        var c = overlapWith(busyIntervals(events), s.getTime(), s.getTime() + dur * 60000, 0);
+        if (!c) proposed = [s];
+        else { conflictNote = 'I already have "' + c.title + '" then, so '; proposed = findSlots(events, now, dur, 2, when.date); }
+      } else if (when){
+        proposed = findSlots(events, now, dur, 2, when.date);
+      } else {
+        proposed = findSlots(events, now, dur, 2);
+      }
+      if (proposed.length){
+        lines.push('');
+        lines.push((conflictNote ? sentence(conflictNote + 'how about ' + fmtSlot(proposed[0]) + '?').replace(/\.$/, '') : 'Would ' + fmtSlot(proposed[0]) + ' work for you?') +
+          (proposed[1] ? ' Alternatively, ' + fmtSlot(proposed[1]) + ' also suits me.' : ''));
+        used.push('picked free slot' + (proposed[1] ? 's' : '') + ' from your calendar (' + eventCount + ' upcoming event' + (eventCount === 1 ? '' : 's') + ' checked)');
+      } else {
+        lines.push('');
+        lines.push('Please let me know a time that suits you.');
+      }
+      var first = name ? name.toLowerCase() : '__nobody__';
+      var withThem = events.find(function(e){ return e.location && e.title && e.title.toLowerCase().indexOf(first) > -1; });
+      if (withThem) lines.push('We could meet at ' + withThem.location + '.');
+      else if (/\b(call|zoom|video|phone)\b/i.test(text)) lines.push('A video call works well for me.');
+      else if (/\b(in person|lunch|dinner|coffee|visit|meet|meeting|office)\b/i.test(text)) lines.push('If you would like to meet in person, please suggest a place that suits you; otherwise a video call is fine with me.');
+    }
+
+    lines.push('');
+    lines.push(sched ? 'Let me know what works best for you.' : (msg ? 'Please let me know if you have any questions.' : 'Looking forward to hearing from you.'));
+    lines.push('');
+    lines.push(style.signoff);
+
+    var subject;
+    if (em.reply) subject = 'Re: ' + em.reply.subject.replace(/^((re|fwd?):\s*)+/i, '');
+    else if (topic) subject = capitalize(topic);
+    else if (msg) subject = capitalize(parts.message.split(/\s+/).slice(0, 6).join(' '));
+    else if (sched) subject = 'Meeting request';
+    else subject = latestSubject;
+
+    var why = (isNew ? 'New contact — no past emails with ' + em.to + '.' : 'Read ' + history.length + ' past email' + (history.length === 1 ? '' : 's') + ' with ' + em.to + '.') +
+      (style.learned ? ' Copied your greeting ("' + style.greeting + '") and sign-off from ' + mine.length + ' of your sent emails.' : ' No sent emails to copy your style from, so used a neutral greeting and sign-off.') +
+      (used.length ? ' ' + capitalize(used.join('; ')) + '.' : '') +
+      ' This is a template-based draft — please review and edit it.';
+    return {subject: subject, body: lines.join('\n').replace(/\n{3,}/g, '\n\n'), blank: false, why: why};
   }
 
   // Reply to an inbox email with an AI draft the user reviews before it sends.
@@ -1084,32 +1286,51 @@
     setStep(1, text);
     setStep(2, 'Checking your calendar and working out the time…');
     fetchUpcomingEvents().catch(function(){ return []; }).then(function(events){
-      return postToAi({mode: 'event', request: text, events: events}).then(function(d){
-        if (d.error || !d.start){
-          setStep(2, d.error || 'I couldn\'t work out a date and time from that — try e.g. "schedule a call with Priya Thursday at 3pm".');
+      var now = new Date();
+      var when = parseWhen(text, now);
+      var durInfo = parseDuration(text);
+      var dur = durInfo ? durInfo.min : (/\b(meeting|lunch|dinner|interview|appointment|workshop|demo)\b/i.test(text) ? 60 : 30);
+      var start, note = '';
+      if (when && when.hh !== null){
+        start = new Date(when.date); start.setHours(when.hh, when.mm, 0, 0);
+        var c = overlapWith(busyIntervals(events), start.getTime(), start.getTime() + dur * 60000, 0);
+        if (c) note = 'Warning: this overlaps with "' + c.title + '" on your calendar.';
+      } else {
+        var slots = findSlots(events, now, dur, 1, when ? when.date : undefined);
+        if (!slots.length){
+          setStep(2, 'I couldn\'t find a free slot' + (when ? ' on that day' : ' in the next 10 days') + ' — try giving a specific time, e.g. "Thursday at 3pm".');
           return;
         }
-        var start = new Date(d.start), end = new Date(d.end || d.start);
-        if (isNaN(start.getTime())){ setStep(2, 'I couldn\'t work out a valid date from that — please rephrase.'); return; }
-        if (isNaN(end.getTime()) || end <= start) end = new Date(start.getTime() + 30 * 60000);
-        var when = start.toLocaleString([], {weekday:'long', month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'}) +
-          ' – ' + end.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
-        runPipeline({
-          module: 'calendar',
-          inputText: text,
-          reasonText: (d.why || 'Worked out the event from your request.') + ' Checked ' + events.length + ' upcoming event' + (events.length === 1 ? '' : 's') + ' for conflicts.',
-          confirmText: 'Add "' + d.title + '" to your real Google Calendar:\n' + when + (d.location ? '\nLocation: ' + d.location : ''),
-          act: function(){
-            createCalendarEvent(d.title, start.toISOString(), end.toISOString()).then(function(ev){
-              state.events.push({id: ev.id, title: d.title, time: start.toLocaleString([], {weekday:'short', hour:'2-digit', minute:'2-digit'})});
-              pushNotif('Booked (live) "' + d.title + '" — ' + when);
-              if (openMod === 'calendar') renderCalendarPanel();
-            }).catch(function(e){ toastError('Booking failed: ' + e.message); });
-          }
-        });
+        start = slots[0];
+        note = 'You didn\'t give a time, so I picked a free slot (' + events.length + ' upcoming event' + (events.length === 1 ? '' : 's') + ' checked).';
+      }
+      var end = new Date(start.getTime() + dur * 60000);
+
+      var title = text;
+      (when ? when.used : []).forEach(function(u){ title = title.replace(new RegExp(esc(u), 'i'), ' '); });
+      if (durInfo) title = title.replace(new RegExp(esc(durInfo.used), 'i'), ' ');
+      title = title.replace(/^\s*(?:please\s+)?(?:can you\s+)?(?:schedule|book|set up|setup|add|create|put|arrange|plan|make)\s+(?:me\s+)?(?:an?\s+|the\s+)?/i, '')
+        .replace(/\b(?:to|in|on)\s+my\s+calendar\b/i, ' ')
+        .replace(/\s+/g, ' ').replace(/\s*\b(?:on|at|for|by|in|to)\s*$/i, '').replace(/^[\s,.\-]+|[\s,.\-]+$/g, '');
+      title = title ? capitalize(title) : 'Meeting';
+
+      var whenText = start.toLocaleDateString([], {weekday:'long', day:'numeric', month:'long'}) + ', ' +
+        start.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'}) + ' – ' + end.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'});
+      runPipeline({
+        module: 'calendar',
+        inputText: text,
+        reasonText: 'Event: "' + title + '" on ' + whenText + '. ' + (note || ('Checked ' + events.length + ' upcoming event' + (events.length === 1 ? '' : 's') + ' — no conflicts.')),
+        confirmText: 'Add "' + title + '" to your real Google Calendar:\n' + whenText + (note ? '\n' + note : ''),
+        act: function(){
+          createCalendarEvent(title, start.toISOString(), end.toISOString()).then(function(ev){
+            state.events.push({id: ev.id, title: title, time: start.toLocaleString([], {weekday:'short', hour:'2-digit', minute:'2-digit'})});
+            pushNotif('Booked (live) "' + title + '" — ' + whenText);
+            if (openMod === 'calendar') renderCalendarPanel();
+          }).catch(function(e){ toastError('Booking failed: ' + e.message); });
+        }
       });
     }).catch(function(e){
-      setStep(2, e.code === 'not_configured' ? 'AI scheduling isn\'t switched on yet.' : 'Couldn\'t schedule that: ' + (e.message || 'unknown error'));
+      setStep(2, 'Couldn\'t schedule that: ' + (e.message || 'unknown error'));
       toastError('Couldn\'t schedule that — ' + (e.message || 'unknown error'));
     });
   }
@@ -1146,25 +1367,19 @@
         fetchUpcomingEvents().catch(function(){ return []; })
       ]).then(function(ctx){
         var history = ctx[0], events = ctx[1];
-        // Brand-new contact: no past email to learn the user's tone from.
-        var isNew = history.length === 0;
-        return (isNew ? fetchSentStyleSamples().catch(function(){ return []; }) : Promise.resolve([])).then(function(style){
-          return requestAiDraft(text, em, history, events, style).then(function(d){
-            em.subject = d.subject || '';
-            em.body = d.body || '';
-            em.blank = d.blank === true || (!em.subject && !em.body);
-            if (em.blank){ em.subject = em.reply ? em.reply.subject.replace(/^(re:\s*)*/i, 'Re: ') : ''; em.body = BLANK_BODY; }
-            else if (em.reply && !/^re:/i.test(em.subject)) em.subject = 'Re: ' + em.subject;
-            em.why = (isNew
-              ? 'New contact — no past emails with ' + em.to + ', so I matched your tone from ' + style.length + ' of your recent sent email' + (style.length === 1 ? '' : 's') + ' and checked ' + events.length + ' upcoming calendar event' + (events.length === 1 ? '' : 's') + '. '
-              : 'Read ' + history.length + ' past email' + (history.length === 1 ? '' : 's') + ' with ' + em.to +
-                ' and ' + events.length + ' upcoming calendar event' + (events.length === 1 ? '' : 's') + '. ') + (d.why || '');
-          });
+        // Too few of the user's own emails to this person to learn their style from:
+        // also sample a few recent sent emails.
+        var mineCount = history.filter(function(h){ return h.from === 'me'; }).length;
+        return (mineCount < 2 ? fetchSentStyleSamples().catch(function(){ return []; }) : Promise.resolve([])).then(function(style){
+          var d = composeLocal(text, em, history, events, style);
+          em.subject = d.subject || '';
+          em.body = d.body || '';
+          em.blank = d.blank === true || (!em.subject && !em.body);
+          if (em.blank){ em.subject = em.reply ? em.reply.subject.replace(/^(re:\s*)*/i, 'Re: ') : ''; em.body = BLANK_BODY; }
+          em.why = d.why;
         }).catch(function(e){
           em.why = '';
-          toastError(e.code === 'not_configured'
-            ? 'Smart drafting isn\'t switched on yet — showing a basic draft instead.'
-            : 'Couldn\'t generate a smart draft — showing a basic one instead.');
+          toastError('Couldn\'t build a draft — showing a basic one instead.');
         });
       }).then(function(){
         proceedToDraft();

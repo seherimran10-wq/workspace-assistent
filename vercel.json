@@ -1,7 +1,0 @@
-{
-  "functions": {
-    "api/draft.js": {
-      "maxDuration": 30
-    }
-  }
-}
