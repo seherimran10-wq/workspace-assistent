@@ -140,11 +140,6 @@
   .pipe-step.done .n::after{content:' \2713';}
 
   .contact{text-align:center;}
-  .demo-note{
-    max-width:640px;margin:0 auto;background:rgba(61,255,160,0.05);border:1px solid var(--line);
-    border-radius:8px;padding:28px 30px;font-size:0.92rem;color:var(--dim);line-height:1.7;text-align:left;
-  }
-  .demo-note strong{color:var(--green);}
 
   footer{text-align:center;padding:32px;font-size:0.78rem;color:var(--dim);border-top:1px solid var(--line);}
 
@@ -177,18 +172,17 @@
       <a href="#modules">Modules</a>
       <a href="#pipeline">How It Runs</a>
     </nav>
-    <a class="header-cta" href="https://seherstudio.vercel.app/services.html">← Back to Studio</a>
   </div>
 </header>
 
 <section class="hero">
   <div class="wrap">
     <div>
-      <div class="kicker">AI Agentic System — Track 02</div>
+      <div class="kicker">AI Agentic System</div>
       <h1>One assistant.<br>Every <span>inbox, calendar,</span><br>and file it touches.</h1>
       <p class="lede">Workspace Assistant connects Gmail, Calendar and Drive into a single AI hub — reading, drafting, scheduling and filing on your behalf, with autonomous auto-reply for the repetitive stuff.</p>
       <div class="btnrow">
-        <a class="btn btn-primary" href="#pipeline">Try The Demo</a>
+        <a class="btn btn-primary" href="#pipeline">Get Started</a>
         <a class="btn btn-outline" href="#modules">See Modules</a>
       </div>
     </div>
@@ -201,9 +195,9 @@
       </div>
       <div class="console-body" id="statusConsole">
         <div class="console-line toggleable" id="googleConnectRow"><span>Google Account <span class="console-hint" id="googleHint">(click to connect)</span></span><span class="status status-idle" id="googleStatus">NOT CONNECTED</span></div>
-        <div class="console-line"><span>Gmail</span><span class="status status-idle" id="gmailStatus">DEMO DATA</span></div>
-        <div class="console-line"><span>Calendar</span><span class="status status-idle" id="calStatus">DEMO DATA</span></div>
-        <div class="console-line"><span>Drive &amp; Docs</span><span class="status status-idle" id="driveStatus">DEMO DATA</span></div>
+        <div class="console-line"><span>Gmail</span><span class="status status-idle" id="gmailStatus">SAMPLE DATA</span></div>
+        <div class="console-line"><span>Calendar</span><span class="status status-idle" id="calStatus">SAMPLE DATA</span></div>
+        <div class="console-line"><span>Drive &amp; Docs</span><span class="status status-idle" id="driveStatus">SAMPLE DATA</span></div>
         <div class="console-line"><span>Gemini Hub</span><span class="status status-on" id="hubStatus">ACTIVE</span></div>
         <div class="console-line toggleable" id="autoReplyRow"><span>Auto-Reply Mode <span class="console-hint">(click to toggle)</span></span><span class="status status-idle" id="autoReplyStatus">STANDBY</span></div>
         <div class="console-line"><span>Notification Center</span><span class="status status-on" id="notifCountStatus">LISTENING</span></div>
@@ -259,24 +253,7 @@
   </div>
 </section>
 
-<section class="contact">
-  <div class="wrap">
-    <div class="eyebrow" style="text-align:center;">Get This Built</div>
-    <h2 style="margin-bottom:24px;">Want your own workspace assistant?</h2>
-    <div class="demo-note">
-      <strong>This is a working demo, not just a mockup.</strong> Try a request above — it runs through a real reasoning + confirm-before-act pipeline. By default it uses sample Gmail, Calendar and Drive data; click "Google Account" in the status panel at the top to sign in and connect your <em>real</em> Gmail, Calendar and Drive — replies you send and events you book from the module panels will be genuine. The same approach can be built around your own tools, whether that's Gmail and Calendar or a completely different stack.
-    </div>
-    <div class="btnrow" style="justify-content:center;margin-top:24px;">
-      <a class="btn btn-primary" href="https://seherstudio.vercel.app/contact.html">Request This Build</a>
-    </div>
-  </div>
-</section>
-
-<footer>Workspace Assistant — an AI Agentic System by Seher Studio</footer>
-
-<a class="whatsapp-fab" href="https://wa.me/971528616162" target="_blank" rel="noopener" aria-label="WhatsApp Us" style="position:fixed;bottom:28px;right:28px;z-index:100;width:58px;height:58px;border-radius:50%;background:#25D366;display:flex;align-items:center;justify-content:center;box-shadow:0 10px 28px -8px rgba(37,211,102,0.6);">
-  <svg viewBox="0 0 24 24" fill="white" width="30" height="30"><path d="M17.6 6.32A7.85 7.85 0 0 0 12.02 4c-4.35 0-7.89 3.53-7.89 7.88 0 1.39.36 2.75 1.05 3.95L4 20l4.28-1.12a7.9 7.9 0 0 0 3.74.95h0c4.35 0 7.89-3.53 7.89-7.88 0-2.1-.82-4.08-2.31-5.63zm-5.58 12.13h0a6.55 6.55 0 0 1-3.34-.92l-.24-.14-2.48.65.66-2.42-.16-.25a6.56 6.56 0 0 1-1-3.49c0-3.62 2.95-6.57 6.58-6.57a6.53 6.53 0 0 1 4.65 1.93 6.5 6.5 0 0 1 1.92 4.64c0 3.62-2.95 6.57-6.59 6.57zm3.6-4.92c-.2-.1-1.17-.58-1.35-.64-.18-.07-.31-.1-.45.1-.13.2-.51.64-.62.77-.11.13-.23.14-.43.05a5.4 5.4 0 0 1-1.59-.98 5.96 5.96 0 0 1-1.1-1.37c-.11-.2 0-.3.09-.4.09-.09.2-.23.3-.35.1-.11.13-.2.2-.33.07-.13.03-.25-.02-.35-.05-.1-.45-1.08-.62-1.48-.16-.39-.33-.33-.45-.34h-.38c-.13 0-.35.05-.53.25s-.7.68-.7 1.67.72 1.94.82 2.07c.1.13 1.42 2.17 3.44 3.04.48.21.86.33 1.15.42.48.15.92.13 1.27.08.39-.06 1.17-.48 1.34-.94.16-.46.16-.86.11-.94-.05-.08-.18-.13-.38-.23z"/></svg>
-</a>
+<footer>Workspace Assistant</footer>
 
 <div class="modal-overlay" id="modalOverlay" hidden>
   <div class="modal-box">
@@ -350,7 +327,7 @@
   function setDataSourceLabels(){
     var connected = state.google.connected;
     [gmailStatus, calStatus, driveStatusEl].forEach(function(el){
-      el.textContent = connected ? 'LIVE' : 'DEMO DATA';
+      el.textContent = connected ? 'LIVE' : 'SAMPLE DATA';
       el.className = 'status ' + (connected ? 'status-on' : 'status-idle');
     });
   }
@@ -459,7 +436,7 @@
     }
     state.google = { connected: false, accessToken: null, email: null, tokenClient: state.google.tokenClient };
     renderGoogleStatus();
-    pushNotif('Disconnected Google account — back to demo data.');
+    pushNotif('Disconnected Google account — back to sample data.');
     if (openMod) openModule(openMod);
   }
 
@@ -512,7 +489,7 @@
 
   function renderGmailPanel(){
     var connected = state.google.connected;
-    var labelText = connected ? ('Live inbox — ' + state.google.email) : 'Inbox — 3 recent (demo data)';
+    var labelText = connected ? ('Live inbox — ' + state.google.email) : 'Inbox — 3 recent (sample data)';
     var connectHint = connected ? '' : '<button class="mini-btn" id="gmailConnectBtn" style="margin-bottom:12px;">Connect Google to use your real inbox</button>';
     var html = state.emails.map(function(e){
       return '<div class="mail-item"><div><div class="mail-from">'+e.from+'</div><div class="mail-subj">'+e.subject+' — '+e.preview+'</div></div>' +
@@ -552,7 +529,7 @@
 
   function renderCalendarPanel(){
     var connected = state.google.connected;
-    var labelText = connected ? ('Live upcoming events — ' + state.google.email) : 'Upcoming (demo data)';
+    var labelText = connected ? ('Live upcoming events — ' + state.google.email) : 'Upcoming (sample data)';
     var connectHint = connected ? '' : '<button class="mini-btn" id="calConnectBtn" style="margin-bottom:12px;">Connect Google to use your real calendar</button>';
     var html = state.events.map(function(ev){
       return '<div class="cal-item"><div><div class="mail-from">'+ev.title+'</div><div class="mail-subj">'+ev.time+'</div></div><span class="replied-tag">✓ Booked</span></div>';
@@ -782,7 +759,7 @@
         act: function(){ state.events.push({id:Date.now(), title:text, time:'This week'}); pushNotif('Booked event from request: "' + text + '" (simulated)'); if (openMod==='calendar') renderCalendarPanel(); }
       });
     } else if (mod === 'drive') {
-      var file = state.files[Math.floor(Math.random()*state.files.length)] || {name:'(no demo files)'};
+      var file = state.files[Math.floor(Math.random()*state.files.length)] || {name:'(no sample files)'};
       runPipeline({
         module:'drive',
         inputText: text,
