@@ -371,10 +371,32 @@
     setDataSourceLabels();
   }
 
+  // Google access tokens last about an hour. Before each call, quietly ask for a
+  // new one if the current one is (nearly) expired, instead of failing.
+  var tokenWaiters = [];
+  function flushTokenWaiters(err){
+    var w = tokenWaiters; tokenWaiters = [];
+    w.forEach(function(x){ if (err) x.reject(err); else x.resolve(); });
+  }
+  function ensureToken(){
+    var g = state.google;
+    if (!g.connected || !g.tokenClient) return Promise.resolve();
+    if (g.accessToken && g.expiresAt && Date.now() < g.expiresAt - 60000) return Promise.resolve();
+    return new Promise(function(resolve, reject){
+      tokenWaiters.push({resolve: resolve, reject: reject});
+      if (tokenWaiters.length === 1){
+        try { g.tokenClient.requestAccessToken({prompt: ''}); } catch(e){ flushTokenWaiters(e); return; }
+        setTimeout(function(){ flushTokenWaiters(new Error('Your Google session expired — click Google Account to reconnect.')); }, 30000);
+      }
+    });
+  }
+
   function gapiFetch(url, opts){
     opts = opts || {};
-    opts.headers = Object.assign({}, opts.headers, {Authorization: 'Bearer ' + state.google.accessToken});
-    return fetch(url, opts).then(function(res){
+    return ensureToken().then(function(){
+      opts.headers = Object.assign({}, opts.headers, {Authorization: 'Bearer ' + state.google.accessToken});
+      return fetch(url, opts);
+    }).then(function(res){
       if (!res.ok) return res.text().then(function(t){ throw new Error('Google API error ' + res.status + ': ' + t); });
       return res.json();
     });
@@ -413,9 +435,9 @@
     });
   }
 
-  async function sendGmailReply(email, replyText){
+  async function sendGmailReply(email, replyText, subjectOverride){
     var to = (email.fromFull.match(/<(.+)>/) || [null, email.fromFull])[1];
-    var subject = email.subject.indexOf('Re:') === 0 ? email.subject : 'Re: ' + email.subject;
+    var subject = subjectOverride || (email.subject.indexOf('Re:') === 0 ? email.subject : 'Re: ' + email.subject);
     var raw = 'To: ' + to + '\r\nSubject: ' + subject + '\r\nContent-Type: text/plain; charset="UTF-8"\r\n\r\n' + replyText;
     return gapiFetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
       method: 'POST',
@@ -442,7 +464,8 @@
   }
 
   async function searchDriveFiles(query){
-    var q = "name contains '" + query.replace(/'/g,"\\'") + "' and trashed=false";
+    var words = String(query).split(/\s+/).filter(Boolean).slice(0, 4);
+    var q = '(' + words.map(function(w){ return "name contains '" + w.replace(/'/g,"\\'") + "'"; }).join(' or ') + ') and trashed=false';
     var data = await gapiFetch('https://www.googleapis.com/drive/v3/files?pageSize=8&fields=files(id,name,webViewLink,mimeType)&q=' + encodeURIComponent(q));
     return data.files || [];
   }
@@ -459,7 +482,7 @@
     if (state.google.accessToken && window.google && google.accounts && google.accounts.oauth2){
       google.accounts.oauth2.revoke(state.google.accessToken, function(){});
     }
-    state.google = { connected: false, accessToken: null, email: null, tokenClient: state.google.tokenClient };
+    state.google = { connected: false, accessToken: null, expiresAt: 0, email: null, tokenClient: state.google.tokenClient };
     renderGoogleStatus();
     pushNotif('Disconnected Google account — back to sample data.');
     if (openMod) openModule(openMod);
@@ -475,11 +498,20 @@
         client_id: GOOGLE_CLIENT_ID,
         scope: GOOGLE_SCOPES,
         callback: function(resp){
-          if (resp.error){ toastError('Google sign-in failed: ' + resp.error); return; }
+          if (resp.error){
+            if (tokenWaiters.length) flushTokenWaiters(new Error('Your Google session expired — click Google Account to reconnect.'));
+            else toastError('Google sign-in failed: ' + resp.error);
+            return;
+          }
           state.google.accessToken = resp.access_token;
+          state.google.expiresAt = Date.now() + (Number(resp.expires_in) || 3600) * 1000;
+          if (tokenWaiters.length){ flushTokenWaiters(); return; }
           state.google.connected = true;
           renderGoogleStatus();
           fetchGoogleProfileAndData();
+        },
+        error_callback: function(){
+          if (tokenWaiters.length) flushTokenWaiters(new Error('Your Google session expired — click Google Account to reconnect.'));
         }
       });
     }
@@ -528,26 +560,11 @@
       btn.addEventListener('click', function(){
         var id = btn.dataset.email;
         var email = state.emails.find(function(e){ return String(e.id) === id; });
-        var replyText = 'Thanks for the note — looking into this now and will follow up shortly.';
-        runPipeline({
-          module:'gmail',
-          inputText: 'Draft reply to ' + email.from + ' — "' + email.subject + '"',
-          reasonText: 'Classified as Gmail request. Drafting a reply in your voice based on: "' + email.preview + '"',
-          confirmText: (connected ? 'Really send' : 'Send') + ' reply to ' + email.from + ': "' + replyText + '"' + (connected ? ' (this will actually send from your Gmail account).' : '.'),
-          skipConfirmIfAutoReply: true,
-          act: function(){
-            var afterAct = function(){
-              email.replied = true;
-              pushNotif((connected ? 'Sent real reply' : 'Replied') + ' to ' + email.from + ' — "' + email.subject + '"');
-              renderGmailPanel();
-            };
-            if (connected){
-              sendGmailReply(email, replyText).then(afterAct).catch(function(e){ toastError('Send failed: ' + e.message); });
-            } else {
-              afterAct();
-            }
-          }
-        });
+        if (!connected){
+          toastError('Connect your Google account to draft a real reply.');
+          return;
+        }
+        runReply(email, 'Reply to ' + email.from + ' about "' + email.subject + '"');
       });
     });
   }
@@ -963,21 +980,17 @@
     });
   }
 
-  function requestAiDraft(text, em, history, events, style){
-    return fetch('/api/draft', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({
-        token: state.google.accessToken,
-        request: text,
-        to: em.to,
-        history: history.map(function(h){ return {from: h.from, date: h.date, subject: h.subject, text: h.text}; }),
-        styleSamples: style || [],
-        events: events,
-        now: new Date().toString(),
-        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-        userEmail: state.google.email
-      })
+  function postToAi(payload){
+    return ensureToken().then(function(){
+      payload.token = state.google.accessToken;
+      payload.now = new Date().toString();
+      payload.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      payload.userEmail = state.google.email;
+      return fetch('/api/draft', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+      });
     }).then(function(res){
       if (!res.ok) return res.json().catch(function(){ return {}; }).then(function(j){
         var err = new Error(j.error || ('status ' + res.status));
@@ -985,6 +998,119 @@
         throw err;
       });
       return res.json();
+    });
+  }
+
+  function requestAiDraft(text, em, history, events, style){
+    return postToAi({
+      request: text,
+      to: em.to,
+      history: history.map(function(h){ return {from: h.from, date: h.date, subject: h.subject, text: h.text}; }),
+      styleSamples: style || [],
+      events: events
+    });
+  }
+
+  // Reply to an inbox email with an AI draft the user reviews before it sends.
+  function runReply(email, text){
+    var to = (email.fromFull.match(/<(.+)>/) || [null, email.fromFull])[1];
+    runSendEmail(text, {
+      to: to,
+      label: email.from + ' <' + to + '>',
+      subject: email.subject.indexOf('Re:') === 0 ? email.subject : 'Re: ' + email.subject,
+      body: BLANK_BODY,
+      blank: true,
+      reply: email,
+      lookupName: null
+    });
+  }
+
+  function runReplyFromText(text){
+    resetPipeline();
+    setStep(1, text);
+    if (!state.google.connected){
+      setStep(2, 'Connect your Google account first (click "Google Account" in the status panel) — then I can draft a real reply.');
+      toastError('Connect your Google account to reply.');
+      return;
+    }
+    var nm = text.match(/\b(?:reply|respond)\s+(?:back\s+)?to\s+(.+?)(?:\s+(?:about|regarding|re|saying|that|telling|asking|and|with)\b|[.,!?]|$)/i);
+    var name = nm ? nm[1].replace(/['’]s$/i, '').replace(/\b(?:the|an?|his|her|their|email|mail|message)\b/gi, '').trim().toLowerCase() : '';
+    var email;
+    if (name){
+      email = state.emails.find(function(e){
+        var n = (e.from || '').toLowerCase();
+        return n && (n.indexOf(name) > -1 || name.indexOf(n) > -1 || name.split(' ').some(function(w){ return w.length > 2 && n.split(' ').indexOf(w) > -1; }));
+      });
+      if (!email){
+        setStep(2, 'I can\'t find a recent inbox email from "' + name + '". To write to them anyway, type: send email to ' + name + ' about …');
+        return;
+      }
+    } else {
+      email = state.emails.find(function(e){ return !e.replied; }) || state.emails[0];
+      if (!email){ setStep(2, 'No inbox messages to reply to.'); return; }
+    }
+    runReply(email, text);
+  }
+
+  function extractDriveQuery(text){
+    var stop = /^(find|search|open|look|for|the|my|a|an|file|files|doc|docs|document|documents|in|on|from|drive|google|please|me|show|get|pull|up|and|of|to|that|about)$/i;
+    return text.replace(/[^\w.\- ]/g, ' ').split(/\s+/).filter(function(w){ return w && !stop.test(w); }).join(' ');
+  }
+
+  function runDriveSearch(text){
+    resetPipeline();
+    setStep(1, text);
+    var q = extractDriveQuery(text);
+    if (!q){ setStep(2, 'What should I look for? e.g. "find the signed NDA".'); return; }
+    setStep(2, 'Searching your Google Drive for "' + q + '"…');
+    searchDriveFiles(q).then(function(files){
+      if (!files.length){
+        setStep(4, 'No files in your Drive match "' + q + '".', 'done');
+        pushNotif('Drive search for "' + q + '" — no matches');
+        return;
+      }
+      var names = files.map(function(f){ return f.name; }).join(', ');
+      setStep(4, 'Found ' + files.length + ' file' + (files.length === 1 ? '' : 's') + ': ' + names + '. Open the Drive module to open one.', 'done');
+      pushNotif('Drive search "' + q + '" — ' + names);
+      pushLog('Searched Drive for "' + q + '": ' + files.length + ' result(s).');
+    }).catch(function(e){
+      setStep(2, 'Drive search failed: ' + e.message);
+      toastError('Drive search failed: ' + e.message);
+    });
+  }
+
+  function runCalendarRequest(text){
+    resetPipeline();
+    setStep(1, text);
+    setStep(2, 'Checking your calendar and working out the time…');
+    fetchUpcomingEvents().catch(function(){ return []; }).then(function(events){
+      return postToAi({mode: 'event', request: text, events: events}).then(function(d){
+        if (d.error || !d.start){
+          setStep(2, d.error || 'I couldn\'t work out a date and time from that — try e.g. "schedule a call with Priya Thursday at 3pm".');
+          return;
+        }
+        var start = new Date(d.start), end = new Date(d.end || d.start);
+        if (isNaN(start.getTime())){ setStep(2, 'I couldn\'t work out a valid date from that — please rephrase.'); return; }
+        if (isNaN(end.getTime()) || end <= start) end = new Date(start.getTime() + 30 * 60000);
+        var when = start.toLocaleString([], {weekday:'long', month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'}) +
+          ' – ' + end.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+        runPipeline({
+          module: 'calendar',
+          inputText: text,
+          reasonText: (d.why || 'Worked out the event from your request.') + ' Checked ' + events.length + ' upcoming event' + (events.length === 1 ? '' : 's') + ' for conflicts.',
+          confirmText: 'Add "' + d.title + '" to your real Google Calendar:\n' + when + (d.location ? '\nLocation: ' + d.location : ''),
+          act: function(){
+            createCalendarEvent(d.title, start.toISOString(), end.toISOString()).then(function(ev){
+              state.events.push({id: ev.id, title: d.title, time: start.toLocaleString([], {weekday:'short', hour:'2-digit', minute:'2-digit'})});
+              pushNotif('Booked (live) "' + d.title + '" — ' + when);
+              if (openMod === 'calendar') renderCalendarPanel();
+            }).catch(function(e){ toastError('Booking failed: ' + e.message); });
+          }
+        });
+      });
+    }).catch(function(e){
+      setStep(2, e.code === 'not_configured' ? 'AI scheduling isn\'t switched on yet.' : 'Couldn\'t schedule that: ' + (e.message || 'unknown error'));
+      toastError('Couldn\'t schedule that — ' + (e.message || 'unknown error'));
     });
   }
 
@@ -1027,7 +1153,8 @@
             em.subject = d.subject || '';
             em.body = d.body || '';
             em.blank = d.blank === true || (!em.subject && !em.body);
-            if (em.blank){ em.subject = ''; em.body = BLANK_BODY; }
+            if (em.blank){ em.subject = em.reply ? em.reply.subject.replace(/^(re:\s*)*/i, 'Re: ') : ''; em.body = BLANK_BODY; }
+            else if (em.reply && !/^re:/i.test(em.subject)) em.subject = 'Re: ' + em.subject;
             em.why = (isNew
               ? 'New contact — no past emails with ' + em.to + ', so I matched your tone from ' + style.length + ' of your recent sent email' + (style.length === 1 ? '' : 's') + ' and checked ' + events.length + ' upcoming calendar event' + (events.length === 1 ? '' : 's') + '. '
               : 'Read ' + history.length + ' past email' + (history.length === 1 ? '' : 's') + ' with ' + em.to +
@@ -1054,9 +1181,10 @@
         showDraft(em, function(subject, body){
           setStep(3, 'Draft approved by user.', 'done');
           setStep(4, 'Sending...');
-          sendGmailMessage(em.to, subject || '(no subject)', body).then(function(){
+          (em.reply ? sendGmailReply(em.reply, body, subject || undefined) : sendGmailMessage(em.to, subject || '(no subject)', body)).then(function(){
             setStep(4, 'Sent — logged to Notification Center.', 'done');
-            pushNotif('Sent email to ' + em.to + ' — "' + (subject || '(no subject)') + '"');
+            pushNotif((em.reply ? 'Sent reply to ' : 'Sent email to ') + em.to + ' — "' + (subject || '(no subject)') + '"');
+            if (em.reply){ em.reply.replied = true; if (openMod === 'gmail') renderGmailPanel(); }
           }).catch(function(e){
             setStep(4, 'Send failed — nothing was sent.');
             toastError('Send failed: ' + e.message);
@@ -1079,9 +1207,18 @@
   }
 
   function runFreeText(text){
+    if (/\b(reply|respond)\b/i.test(text)) return runReplyFromText(text);
     var em = parseSendEmail(text);
     if (em) return runSendEmail(text, em);
     var mod = classify(text);
+    if (state.google.connected && mod === 'calendar') return runCalendarRequest(text);
+    if (state.google.connected && mod === 'drive') return runDriveSearch(text);
+    if (state.google.connected){
+      resetPipeline();
+      setStep(1, text);
+      setStep(2, 'I can\'t do that one yet. Try: "send email to name@example.com about …", "reply to Alex about …", "schedule a call with Priya Thursday at 3pm", or "find the signed NDA".');
+      return;
+    }
     var simNote = state.google.connected ? ' (simulated routing — use the module buttons above to actually send/book/open with your connected account)' : '';
     if (mod === 'gmail') {
       var email = state.emails.find(function(e){ return !e.replied; }) || state.emails[0];
