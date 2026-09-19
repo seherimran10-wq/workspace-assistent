@@ -150,6 +150,10 @@
   .modal-head{background:#0D1116;padding:14px 18px;border-bottom:1px solid var(--line);font-family:'JetBrains Mono',monospace;font-size:0.78rem;color:var(--green);display:flex;justify-content:space-between;align-items:center;}
   .modal-body{padding:22px;font-size:0.9rem;color:var(--ink);line-height:1.6;}
   #modalText{white-space:pre-wrap;}
+  .draft-field{width:100%;background:var(--bg);border:1px solid var(--line);color:var(--ink);padding:10px 12px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:0.8rem;line-height:1.5;}
+  .draft-field:focus{outline:none;border-color:var(--green);}
+  textarea.draft-field{resize:vertical;}
+  #draftSend:disabled{opacity:0.45;cursor:default;}
   .modal-body .label{font-family:'JetBrains Mono',monospace;font-size:0.7rem;color:var(--dim);text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px;}
   .modal-actions{display:flex;gap:10px;padding:0 22px 22px;}
   .modal-actions .btn{flex:1;text-align:center;}
@@ -266,6 +270,25 @@
     <div class="modal-actions">
       <button class="btn btn-outline" id="modalCancel">Cancel</button>
       <button class="btn btn-primary" id="modalConfirm">Confirm & Act</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="draftOverlay" hidden>
+  <div class="modal-box" style="max-width:560px;">
+    <div class="modal-head"><span>REVIEW DRAFT — NOT SENT YET</span><span>GMAIL</span></div>
+    <div class="modal-body">
+      <div class="label">To</div>
+      <div id="draftTo" style="word-break:break-all;"></div>
+      <div class="label" style="margin-top:14px;">Subject</div>
+      <input class="draft-field" id="draftSubject" type="text" placeholder="Subject">
+      <div class="label" style="margin-top:14px;">Message</div>
+      <textarea class="draft-field" id="draftBody" rows="9"></textarea>
+      <div id="draftHint" style="margin-top:10px;font-size:0.76rem;color:var(--dim);">Edit anything above, then press Send. Nothing is sent until you do.</div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-outline" id="draftCancel">Cancel</button>
+      <button class="btn btn-primary" id="draftSend">Send Email</button>
     </div>
   </div>
 </div>
@@ -768,17 +791,54 @@
     var message = rest.match(/\b(?:saying|say|that|telling (?:them|him|her)|asking)\s+(.+)$/i);
     var topic = rest.match(/\b(?:about|regarding|re|on)\s+(.+?)(?:\s+(?:saying|that|telling|asking)\b|$)/i);
     var subject, body;
+    var blank = false;
     if (message){
       body = capitalize(message[1].trim());
       subject = topic ? capitalize(topic[1].trim()) : capitalize(message[1].trim().split(/\s+/).slice(0, 6).join(' '));
+      body = 'Hi,\n\n' + body + '\n\nBest regards';
     } else if (topic){
       subject = capitalize(topic[1].trim());
       body = 'Hi,\n\nI wanted to reach out regarding ' + topic[1].trim() + '.\n\nBest regards';
     } else {
-      return {error: 'What should the email say? Add something like "about the invoice" or "saying the files are ready".'};
+      // Recipient but no content: open a blank draft for the user to write.
+      blank = true;
+      subject = '';
+      body = BLANK_BODY;
     }
-    if (message) body = 'Hi,\n\n' + body + '\n\nBest regards';
-    return {to: to, label: label, subject: subject, body: body};
+    return {to: to, label: label, subject: subject, body: body, blank: blank};
+  }
+
+  var BLANK_BODY = 'Hi,\n\n\n\nBest regards';
+
+  // Shows the editable draft window. onSend receives the final subject/body
+  // exactly as edited; onCancel fires if the user backs out.
+  function showDraft(em, onSend, onCancel){
+    var box = document.getElementById('draftOverlay');
+    var subj = document.getElementById('draftSubject');
+    var bodyEl = document.getElementById('draftBody');
+    var sendBtn = document.getElementById('draftSend');
+    document.getElementById('draftTo').textContent = em.label;
+    subj.value = em.subject;
+    bodyEl.value = em.body;
+
+    function refresh(){
+      var empty = !subj.value.trim() && (!bodyEl.value.trim() || bodyEl.value === BLANK_BODY);
+      sendBtn.disabled = empty;
+    }
+    subj.oninput = refresh;
+    bodyEl.oninput = refresh;
+    refresh();
+
+    function close(){ box.hidden = true; }
+    sendBtn.onclick = function(){ close(); onSend(subj.value.trim(), bodyEl.value); };
+    document.getElementById('draftCancel').onclick = function(){ close(); onCancel(); };
+
+    box.hidden = false;
+    if (em.blank){
+      subj.focus();
+    } else {
+      bodyEl.focus();
+    }
   }
 
   function runSendEmail(text, em){
@@ -791,17 +851,27 @@
         toastError('Connect your Google account to send email.');
         return;
       }
-      runPipeline({
-        module:'gmail',
-        inputText: text,
-        reasonText: 'Drafted an email to ' + em.label + ' with subject "' + em.subject + '".',
-        confirmText: 'Send this email from your Gmail account?\n\nTo: ' + em.label + '\nSubject: ' + em.subject + '\n\n' + em.body,
-        act: function(){
-          sendGmailMessage(em.to, em.subject, em.body).then(function(){
-            pushNotif('Sent email to ' + em.to + ' — "' + em.subject + '"');
-          }).catch(function(e){ toastError('Send failed: ' + e.message); });
-        }
-      });
+      setStep(2, em.blank
+        ? 'Got the recipient (' + em.label + ') but no subject or message — opened a blank draft for you to write.'
+        : 'Drafted an email to ' + em.label + ' with subject "' + em.subject + '". Review it before it sends.');
+      pushLog('Drafted email to ' + em.label);
+      setTimeout(function(){
+        setStep(3, 'Waiting for you to review and send the draft...');
+        showDraft(em, function(subject, body){
+          setStep(3, 'Draft approved by user.', 'done');
+          setStep(4, 'Sending...');
+          sendGmailMessage(em.to, subject || '(no subject)', body).then(function(){
+            setStep(4, 'Sent — logged to Notification Center.', 'done');
+            pushNotif('Sent email to ' + em.to + ' — "' + (subject || '(no subject)') + '"');
+          }).catch(function(e){
+            setStep(4, 'Send failed — nothing was sent.');
+            toastError('Send failed: ' + e.message);
+          });
+        }, function(){
+          setStep(3, 'Draft cancelled by user.', 'done');
+          pushNotif('Cancelled draft email to ' + em.to);
+        });
+      }, 500);
     }, 400);
   }
 
