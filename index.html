@@ -775,6 +775,7 @@
     var to = addr ? addr[0] : null;
     var label = to;
 
+    var lookupName = null;
     if (!to){
       var nm = rest.match(/\bto\s+(.+?)(?:\s+(?:about|regarding|re|saying|that|telling|asking)\b|$)/i);
       var name = nm ? nm[1].trim().toLowerCase() : '';
@@ -782,10 +783,11 @@
       if (known){
         to = (known.fromFull.match(/<(.+)>/) || [null, known.fromFull])[1];
         label = known.from + ' <' + to + '>';
+      } else if (name){
+        // Not in the loaded inbox — runSendEmail searches Gmail for this name.
+        lookupName = name;
       } else {
-        return {error: name
-          ? 'I can\'t find an email address for "' + name + '" — type their full address (e.g. name@example.com).'
-          : 'Who should it go to? Include their full email address (e.g. name@example.com).'};
+        return {error: 'Who should it go to? Include their full email address (e.g. name@example.com).'};
       }
     }
 
@@ -806,7 +808,56 @@
       subject = '';
       body = BLANK_BODY;
     }
-    return {to: to, label: label, subject: subject, body: body, blank: blank};
+    return {to: to, label: label, subject: subject, body: body, blank: blank, lookupName: lookupName};
+  }
+
+  // Finds an address for a name by searching the user's Gmail (people they've
+  // exchanged mail with who aren't in the loaded inbox list). Resolves to
+  // {to, label} or null.
+  function lookupAddressByName(name){
+    var clean = name.replace(/[^\w .'-]/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!clean) return Promise.resolve(null);
+    var q = 'from:(' + clean + ') OR to:(' + clean + ')';
+    return gapiFetch('https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=10&q=' + encodeURIComponent(q)).then(function(list){
+      var ids = (list.messages || []).map(function(m){ return m.id; });
+      return Promise.all(ids.map(function(id){
+        return gapiFetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/' + id +
+          '?format=metadata&metadataHeaders=From&metadataHeaders=To');
+      }));
+    }).then(function(msgs){
+      var counts = {}, names = {};
+      var words = clean.toLowerCase().split(' ');
+      msgs.forEach(function(m){
+        (headerOf(m, 'From') + ',' + headerOf(m, 'To')).split(',').forEach(function(part){
+          var mm = part.match(/^\s*"?([^"<]*?)"?\s*<([^>]+)>\s*$/) || part.match(/^\s*()([^\s<>]+@[^\s<>]+)\s*$/);
+          if (!mm) return;
+          var display = mm[1].trim(), addr = mm[2].trim().toLowerCase();
+          if (addr === (state.google.email || '').toLowerCase()) return;
+          var hay = (display + ' ' + addr).toLowerCase();
+          if (!words.every(function(w){ return hay.indexOf(w) > -1; })) return;
+          counts[addr] = (counts[addr] || 0) + 1;
+          if (display) names[addr] = display;
+        });
+      });
+      var best = Object.keys(counts).sort(function(a, b){ return counts[b] - counts[a]; })[0];
+      if (!best) return null;
+      return {to: best, label: (names[best] ? names[best] + ' <' + best + '>' : best)};
+    });
+  }
+
+  // Samples of the user's own recent sent mail, so drafts to brand-new contacts
+  // still match their tone and sign-off.
+  function fetchSentStyleSamples(){
+    return gapiFetch('https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=4&q=' + encodeURIComponent('in:sent')).then(function(list){
+      var ids = (list.messages || []).map(function(m){ return m.id; });
+      return Promise.all(ids.map(function(id){
+        return gapiFetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/' + id + '?format=full');
+      }));
+    }).then(function(msgs){
+      return msgs.map(function(m){
+        return {subject: headerOf(m, 'Subject'), text: stripQuoted(messageText(m.payload) || m.snippet || '')};
+      }).filter(function(s){ return s.text; });
+    });
   }
 
   var BLANK_BODY = 'Hi,\n\n\n\nBest regards';
@@ -912,7 +963,7 @@
     });
   }
 
-  function requestAiDraft(text, em, history, events){
+  function requestAiDraft(text, em, history, events, style){
     return fetch('/api/draft', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
@@ -921,6 +972,7 @@
         request: text,
         to: em.to,
         history: history.map(function(h){ return {from: h.from, date: h.date, subject: h.subject, text: h.text}; }),
+        styleSamples: style || [],
         events: events,
         now: new Date().toString(),
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
@@ -946,19 +998,41 @@
         toastError('Connect your Google account to send email.');
         return;
       }
+      if (em.lookupName){
+        setStep(2, 'Searching your Gmail for "' + em.lookupName + '"…');
+        lookupAddressByName(em.lookupName).catch(function(){ return null; }).then(function(found){
+          if (!found){
+            setStep(2, 'I can\'t find an email address for "' + em.lookupName + '" — type their full address (e.g. name@example.com).');
+            return;
+          }
+          em.to = found.to;
+          em.label = found.label;
+          draftWithContext();
+        });
+      } else {
+        draftWithContext();
+      }
+
+      function draftWithContext(){
       setStep(2, 'Reading your past emails with ' + em.to + ' and your calendar for the next 10 days…');
       Promise.all([
         fetchHistoryWith(em.to).catch(function(){ return []; }),
         fetchUpcomingEvents().catch(function(){ return []; })
       ]).then(function(ctx){
         var history = ctx[0], events = ctx[1];
-        return requestAiDraft(text, em, history, events).then(function(d){
-          em.subject = d.subject || '';
-          em.body = d.body || '';
-          em.blank = d.blank === true || (!em.subject && !em.body);
-          if (em.blank){ em.subject = ''; em.body = BLANK_BODY; }
-          em.why = 'Read ' + history.length + ' past email' + (history.length === 1 ? '' : 's') + ' with ' + em.to +
-            ' and ' + events.length + ' upcoming calendar event' + (events.length === 1 ? '' : 's') + '. ' + (d.why || '');
+        // Brand-new contact: no past email to learn the user's tone from.
+        var isNew = history.length === 0;
+        return (isNew ? fetchSentStyleSamples().catch(function(){ return []; }) : Promise.resolve([])).then(function(style){
+          return requestAiDraft(text, em, history, events, style).then(function(d){
+            em.subject = d.subject || '';
+            em.body = d.body || '';
+            em.blank = d.blank === true || (!em.subject && !em.body);
+            if (em.blank){ em.subject = ''; em.body = BLANK_BODY; }
+            em.why = (isNew
+              ? 'New contact — no past emails with ' + em.to + ', so I matched your tone from ' + style.length + ' of your recent sent email' + (style.length === 1 ? '' : 's') + ' and checked ' + events.length + ' upcoming calendar event' + (events.length === 1 ? '' : 's') + '. '
+              : 'Read ' + history.length + ' past email' + (history.length === 1 ? '' : 's') + ' with ' + em.to +
+                ' and ' + events.length + ' upcoming calendar event' + (events.length === 1 ? '' : 's') + '. ') + (d.why || '');
+          });
         }).catch(function(e){
           em.why = '';
           toastError(e.code === 'not_configured'
@@ -968,6 +1042,7 @@
       }).then(function(){
         proceedToDraft();
       });
+      }
 
       function proceedToDraft(){
       setStep(2, em.blank
