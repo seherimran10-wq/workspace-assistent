@@ -1,7 +1,7 @@
-// Drafts an email with Claude using context the browser already fetched from
+// Drafts an email with Google Gemini using context the browser already fetched from
 // the user's own Gmail/Calendar. Stateless: nothing is stored or logged.
 const GOOGLE_CLIENT_ID = '118202641770-jjr3c788jvgo5sf9a3oib8s9a5ltjr8u.apps.googleusercontent.com';
-const MODEL = 'claude-sonnet-5';
+const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 const MAX_HISTORY = 8;
 const MAX_TEXT = 1500;
 const MAX_EVENTS = 30;
@@ -73,7 +73,7 @@ module.exports = async function handler(req, res) {
     res.setHeader('Allow', 'POST');
     return res.status(405).json({ error: 'method_not_allowed' });
   }
-  if (!process.env.ANTHROPIC_API_KEY) {
+  if (!process.env.GEMINI_API_KEY) {
     return res.status(503).json({ error: 'not_configured' });
   }
 
@@ -115,26 +115,32 @@ module.exports = async function handler(req, res) {
   });
 
   try {
-    const apiRes = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        max_tokens: 1200,
-        system: SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: userMessage }],
-      }),
-    });
+    const apiRes = await fetch(
+      'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(MODEL) + ':generateContent',
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-goog-api-key': process.env.GEMINI_API_KEY,
+        },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+          contents: [{ role: 'user', parts: [{ text: userMessage }] }],
+          generationConfig: {
+            responseMimeType: 'application/json',
+            maxOutputTokens: 4096,
+            temperature: 0.7,
+          },
+        }),
+      }
+    );
     if (!apiRes.ok) {
-      console.error('Anthropic API error status:', apiRes.status);
+      console.error('Gemini API error status:', apiRes.status);
       return res.status(502).json({ error: 'ai_unavailable', status: apiRes.status });
     }
     const data = await apiRes.json();
-    const text = (data.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('');
+    const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
+    const text = parts.map((p) => p.text || '').join('');
     const draft = extractJson(text);
     return res.status(200).json({
       subject: clip(draft.subject, 300),
