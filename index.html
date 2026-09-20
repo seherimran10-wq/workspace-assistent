@@ -112,6 +112,31 @@
   .toggle-track.on{background:rgba(61,255,160,0.25);border-color:var(--green);}
   .toggle-dot{position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:var(--dim);transition:transform .15s, background .15s;}
   .toggle-track.on .toggle-dot{transform:translateX(20px);background:var(--green);}
+  .soc-note{color:var(--dim);font-size:0.8rem;line-height:1.6;margin-bottom:16px;max-width:760px;}
+  .soc-plat{display:flex;flex-wrap:wrap;gap:10px 22px;align-items:center;margin-bottom:18px;}
+  .soc-plat-item{display:flex;align-items:center;gap:8px;color:var(--ink);}
+  .soc-plat-item label{display:flex;align-items:center;gap:6px;cursor:pointer;}
+  .soc-badge{font-size:0.66rem;color:var(--dim);border:1px solid var(--line);border-radius:10px;padding:2px 8px;}
+  .soc-setup{flex-basis:100%;color:var(--dim);font-size:0.76rem;line-height:1.55;border-left:2px solid var(--green);padding-left:10px;}
+  .soc-grid{display:grid;grid-template-columns:1fr 1fr;gap:26px;}
+  @media (max-width:820px){.soc-grid{grid-template-columns:1fr;}}
+  .soc-label{font-size:0.7rem;color:var(--dim);text-transform:uppercase;margin-bottom:8px;}
+  .soc-media{display:block;max-width:100%;max-height:260px;border-radius:6px;border:1px solid var(--line);background:#000;}
+  .soc-meta{color:var(--dim);font-size:0.74rem;margin-top:8px;word-break:break-all;}
+  .soc-tip{color:#F0BE4D;font-size:0.74rem;margin-top:6px;}
+  .soc-file{cursor:pointer;display:inline-block;}
+  .soc-count{display:flex;flex-wrap:wrap;gap:4px 16px;color:var(--dim);font-size:0.72rem;margin-top:8px;}
+  .soc-over{color:var(--red);}
+  .soc-tags{margin-top:10px;display:flex;flex-wrap:wrap;gap:6px;align-items:center;}
+  .soc-hint{color:var(--dim);font-size:0.74rem;}
+  .soc-card{border:1px solid var(--line);border-radius:6px;padding:12px 14px;margin-bottom:10px;background:var(--bg);}
+  .soc-card-h{color:var(--green);font-size:0.7rem;text-transform:uppercase;margin-bottom:6px;}
+  .soc-card-b{color:var(--ink);font-size:0.8rem;line-height:1.55;white-space:pre-wrap;word-break:break-word;}
+  .soc-status{margin-top:18px;font-size:0.78rem;line-height:1.6;}
+  .soc-ok{color:var(--green);}
+  .soc-bad{color:var(--red);}
+  .soc-plat-item .mini-btn{padding:3px 9px;}
+  #socPost:disabled{opacity:0.45;cursor:default;}
 
   .log-line{padding:9px 0;border-bottom:1px dashed var(--line);font-size:0.78rem;color:var(--dim);display:flex;gap:10px;}
   .log-line:last-child{border-bottom:none;}
@@ -225,6 +250,7 @@
       <div class="module" data-mod="gemini"><span class="tag">MOD.04 <span class="chev">▸</span></span><h3>Gemini Hub</h3><p>The reasoning core — routes requests to the right module and keeps context across them.</p></div>
       <div class="module" data-mod="autoreply"><span class="tag">MOD.05 <span class="chev">▸</span></span><h3>Autonomous Auto-Reply</h3><p>Handles routine messages end-to-end, with a confirmation step before anything sends.</p></div>
       <div class="module" data-mod="notifications"><span class="tag">MOD.06 <span class="chev">▸</span></span><h3>Notification Center</h3><p>One unified feed instead of five separate app notifications competing for attention.</p></div>
+      <div class="module" data-mod="social"><span class="tag">MOD.07 <span class="chev">▸</span></span><h3>Social Posting</h3><p>Compose once and prepare posts for Instagram, Facebook and TikTok, checked against each platform's rules and reviewed by you before anything goes out.</p></div>
     </div>
     <div class="module-panel" id="modulePanel" hidden></div>
   </div>
@@ -687,7 +713,249 @@
       (state.notifications.length ? state.notifications.map(function(n){ return '<div class="log-line"><span class="t">'+n.t+'</span><span>'+n.text+'</span></div>'; }).join('') : '<div class="empty-log">Nothing yet — actions across Gmail, Calendar and Drive will appear here.</div>');
   }
 
-  var renderers = {gmail:renderGmailPanel, calendar:renderCalendarPanel, drive:renderDrivePanel, gemini:renderGeminiPanel, autoreply:renderAutoReplyPanel, notifications:renderNotifPanel};
+  // ---- Social Posting composer (Instagram / Facebook / TikTok) ----
+  // Everything here happens in the browser. Files you pick are only previewed
+  // locally and are never uploaded; one-click posting needs platform accounts
+  // connected through a backend, which isn't set up yet.
+  var SOCIAL = {
+    instagram: {name:'Instagram', limit:2200, needsMedia:true, kinds:['image','video'], open:'https://www.instagram.com/',
+      setup:'One-click Instagram posting needs a Meta developer app and an Instagram Business or Creator account linked to a Facebook Page.'},
+    facebook: {name:'Facebook', limit:63206, needsMedia:false, kinds:['image','video'], open:'https://business.facebook.com/latest/composer',
+      setup:'One-click Facebook posting needs a Meta developer app and admin access to the Page you post to.'},
+    tiktok: {name:'TikTok', limit:2200, needsMedia:true, kinds:['video'], open:'https://www.tiktok.com/tiktokstudio/upload',
+      setup:'One-click TikTok posting needs a TikTok developer app. Until TikTok approves it, API posts can only be private ("only me").'}
+  };
+  var social = {caption:'', file:null, url:null, kind:null, meta:'', tip:'', note:'', targets:{instagram:true, facebook:true, tiktok:false}};
+
+  try {
+    var savedSocial = JSON.parse(localStorage.getItem('wa_social_draft') || 'null');
+    if (savedSocial){
+      social.caption = String(savedSocial.caption || '');
+      Object.keys(social.targets).forEach(function(k){
+        if (savedSocial.targets && typeof savedSocial.targets[k] === 'boolean') social.targets[k] = savedSocial.targets[k];
+      });
+    }
+  } catch(e){}
+  function saveSocialDraft(){
+    try { localStorage.setItem('wa_social_draft', JSON.stringify({caption: social.caption, targets: social.targets})); } catch(e){}
+  }
+
+  function toastInfo(msg){
+    var t = document.createElement('div');
+    t.textContent = msg;
+    t.style.cssText = 'position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#0d2a1d;border:1px solid var(--green);color:var(--green);padding:12px 20px;border-radius:8px;font-family:JetBrains Mono,monospace;font-size:0.8rem;z-index:300;max-width:80vw;';
+    document.body.appendChild(t);
+    setTimeout(function(){ t.remove(); }, 3500);
+  }
+
+  function escapeHtml(s){
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+  function fmtBytes(n){
+    return n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB';
+  }
+  function fmtDuration(sec){
+    sec = Math.round(sec);
+    return Math.floor(sec / 60) + ':' + ('0' + (sec % 60)).slice(-2);
+  }
+  function hashtagCount(text){ return (text.match(/#[\p{L}\p{N}_]+/gu) || []).length; }
+
+  function socialProblems(){
+    var out = {};
+    Object.keys(SOCIAL).forEach(function(k){
+      if (!social.targets[k]) return;
+      var p = SOCIAL[k], errs = [];
+      if (!social.caption.trim() && !social.file) errs.push('Add a caption or some media.');
+      if (p.needsMedia && !social.file) errs.push(p.name + ' posts need ' + (p.kinds.length === 1 ? 'a video.' : 'an image or video.'));
+      else if (social.file && p.kinds.indexOf(social.kind) === -1) errs.push(p.name + ' needs a ' + p.kinds.join(' or ') + ', not ' + (social.kind === 'image' ? 'an image' : 'a video') + '.');
+      var n = social.caption.length;
+      if (n > p.limit) errs.push('Caption is ' + (n - p.limit).toLocaleString() + ' characters over the ' + p.limit.toLocaleString() + ' limit.');
+      if (k === 'instagram' && hashtagCount(social.caption) > 30) errs.push('Instagram allows at most 30 hashtags (you have ' + hashtagCount(social.caption) + ').');
+      out[k] = errs;
+    });
+    return out;
+  }
+
+  var HASHTAG_STOP = /^(this|that|with|from|have|will|your|about|their|there|what|when|where|which|would|could|should|been|were|they|them|then|than|into|just|like|more|some|very|also|over|only|come|make|made|need|want|today|check|link|bio)$/i;
+  function suggestHashtags(text){
+    var counts = {};
+    (text.toLowerCase().match(/[\p{L}\p{N}]{4,}/gu) || []).forEach(function(w){
+      if (HASHTAG_STOP.test(w) || /^\d+$/.test(w)) return;
+      counts[w] = (counts[w] || 0) + 1;
+    });
+    var existing = (text.toLowerCase().match(/#[\p{L}\p{N}_]+/gu) || []);
+    return Object.keys(counts).sort(function(a, b){ return counts[b] - counts[a] || b.length - a.length; })
+      .filter(function(w){ return existing.indexOf('#' + w) === -1; }).slice(0, 6);
+  }
+
+  function setSocialFile(file){
+    if (social.url) URL.revokeObjectURL(social.url);
+    social.file = null; social.url = null; social.kind = null; social.meta = ''; social.tip = '';
+    if (!file){ socialRenderHeavy(); socialRenderLight(); return; }
+    var kind = file.type.indexOf('image/') === 0 ? 'image' : (file.type.indexOf('video/') === 0 ? 'video' : null);
+    if (!kind){ toastError('Please choose an image or a video file.'); socialRenderHeavy(); socialRenderLight(); return; }
+    social.file = file; social.kind = kind; social.url = URL.createObjectURL(file);
+    social.meta = (kind === 'image' ? 'Image' : 'Video') + ' · ' + fmtBytes(file.size);
+    var probe = kind === 'image' ? new Image() : document.createElement('video');
+    var current = social.url;
+    function done(w, h, dur){
+      if (social.url !== current) return;
+      social.meta = (kind === 'image' ? 'Image' : 'Video') + (dur ? ' · ' + fmtDuration(dur) : '') + ' · ' + w + '×' + h + ' · ' + fmtBytes(file.size);
+      if (kind === 'video' && w > h) social.tip = 'Landscape video — TikTok and Reels work best in vertical 9:16.';
+      socialRenderHeavy(); socialRenderLight();
+    }
+    if (kind === 'image'){ probe.onload = function(){ done(probe.naturalWidth, probe.naturalHeight); }; }
+    else { probe.preload = 'metadata'; probe.onloadedmetadata = function(){ done(probe.videoWidth, probe.videoHeight, probe.duration); }; }
+    probe.src = current;
+    socialRenderHeavy(); socialRenderLight();
+  }
+
+  function copyCaption(){
+    if (!social.caption.trim()) return Promise.resolve(false);
+    try {
+      return navigator.clipboard.writeText(social.caption).then(function(){ return true; }, function(){ return false; });
+    } catch(e){ return Promise.resolve(false); }
+  }
+
+  function socialRenderHeavy(){
+    var plat = document.getElementById('socPlat');
+    if (!plat) return;
+    plat.innerHTML = Object.keys(SOCIAL).map(function(k){
+      var p = SOCIAL[k];
+      return '<div class="soc-plat-item"><label><input type="checkbox" data-plat="' + k + '"' + (social.targets[k] ? ' checked' : '') + '> ' + p.name + '</label>' +
+        '<span class="soc-badge">Not connected</span><button class="mini-btn" data-connect="' + k + '">Connect</button></div>';
+    }).join('') + '<div class="soc-setup" id="socSetup"' + (social.note ? '' : ' hidden') + '>' + escapeHtml(social.note) + '</div>';
+    plat.querySelectorAll('[data-plat]').forEach(function(cb){
+      cb.addEventListener('change', function(){ social.targets[cb.dataset.plat] = cb.checked; saveSocialDraft(); socialRenderLight(); });
+    });
+    plat.querySelectorAll('[data-connect]').forEach(function(b){
+      b.addEventListener('click', function(){ social.note = SOCIAL[b.dataset.connect].setup + ' That isn\'t set up yet, so for now use "Copy caption & open" below.'; socialRenderHeavy(); });
+    });
+
+    var media = document.getElementById('socMedia');
+    var preview = '';
+    if (social.url) preview = social.kind === 'image'
+      ? '<img class="soc-media" src="' + social.url + '" alt="Selected image preview">'
+      : '<video class="soc-media" src="' + social.url + '" controls muted playsinline></video>';
+    media.innerHTML = preview +
+      (social.file ? '<div class="soc-meta">' + escapeHtml(social.file.name) + '<br>' + escapeHtml(social.meta) + '</div>' +
+        (social.tip ? '<div class="soc-tip">' + escapeHtml(social.tip) + '</div>' : '') : '') +
+      '<div class="add-row" style="margin-top:8px;"><label class="mini-btn soc-file">' + (social.file ? 'Replace file' : 'Choose image or video') +
+      '<input type="file" id="socFile" accept="image/*,video/*" hidden></label>' +
+      (social.file ? '<button class="mini-btn" id="socRemove">Remove</button>' : '') + '</div>';
+    document.getElementById('socFile').addEventListener('change', function(e){ setSocialFile(e.target.files && e.target.files[0]); });
+    var rm = document.getElementById('socRemove');
+    if (rm) rm.addEventListener('click', function(){ setSocialFile(null); });
+  }
+
+  function socialRenderLight(){
+    var counts = document.getElementById('socCount');
+    if (!counts) return;
+    var problems = socialProblems();
+    var selected = Object.keys(problems);
+
+    counts.innerHTML = selected.map(function(k){
+      var over = social.caption.length > SOCIAL[k].limit;
+      return '<span class="' + (over ? 'soc-over' : '') + '">' + SOCIAL[k].name + ' ' + social.caption.length.toLocaleString() + '/' + SOCIAL[k].limit.toLocaleString() + '</span>';
+    }).join('') + (social.targets.instagram ? '<span>Hashtags ' + hashtagCount(social.caption) + '/30</span>' : '');
+
+    var tags = suggestHashtags(social.caption);
+    document.getElementById('socTags').innerHTML = tags.length
+      ? '<span class="soc-hint">Hashtag ideas:</span> ' + tags.map(function(t){ return '<button class="chip" data-tag="' + escapeHtml(t) + '">#' + escapeHtml(t) + '</button>'; }).join(' ')
+      : '<span class="soc-hint">Write a caption and I\'ll suggest hashtags from your words.</span>';
+    document.querySelectorAll('#socTags [data-tag]').forEach(function(b){
+      b.addEventListener('click', function(){
+        var ta = document.getElementById('socCaption');
+        ta.value = ta.value.replace(/\s+$/, '') + (ta.value.trim() ? ' ' : '') + '#' + b.dataset.tag;
+        social.caption = ta.value; saveSocialDraft(); socialRenderLight();
+      });
+    });
+
+    document.getElementById('socPreview').innerHTML = selected.length ? selected.map(function(k){
+      var cap = social.caption, cut = false;
+      if (k === 'instagram' && cap.length > 125){ cap = cap.slice(0, 125); cut = true; }
+      return '<div class="soc-card"><div class="soc-card-h">' + SOCIAL[k].name + '</div><div class="soc-card-b">' +
+        (escapeHtml(cap) || '<span class="soc-hint">(no caption)</span>') + (cut ? '… <span class="soc-hint">more</span>' : '') + '</div></div>';
+    }).join('') : '<div class="soc-hint">Tick at least one platform above.</div>';
+
+    var status = document.getElementById('socStatus');
+    status.innerHTML = selected.length ? selected.map(function(k){
+      var errs = problems[k];
+      return errs.length
+        ? '<div class="soc-bad"><strong>' + SOCIAL[k].name + ':</strong> ' + errs.map(escapeHtml).join(' ') + '</div>'
+        : '<div class="soc-ok"><strong>' + SOCIAL[k].name + ':</strong> ready to post.</div>';
+    }).join('') : '';
+
+    var actions = document.getElementById('socActions');
+    actions.innerHTML = '<button class="btn btn-primary" id="socPost" disabled style="padding:9px 18px;font-size:0.78rem;">Post to selected (connect accounts first)</button>' +
+      '<button class="mini-btn" id="socCopy">Copy caption</button>' +
+      selected.map(function(k){ return '<button class="mini-btn" data-open="' + k + '">Copy caption &amp; open ' + SOCIAL[k].name + '</button>'; }).join('');
+    document.getElementById('socCopy').addEventListener('click', function(){
+      copyCaption().then(function(ok){
+        if (ok) pushNotif('Copied social caption to clipboard.'); else toastError(social.caption.trim() ? 'Couldn\'t copy — select the text and copy it manually.' : 'Write a caption first.');
+      });
+    });
+    actions.querySelectorAll('[data-open]').forEach(function(b){
+      b.addEventListener('click', function(){
+        var p = SOCIAL[b.dataset.open];
+        window.open(p.open, '_blank', 'noopener');
+        copyCaption().then(function(ok){
+          pushNotif('Opened ' + p.name + (ok ? ' — caption copied, paste it into the new post.' : '.'));
+          if (ok) toastInfo('Caption copied — paste it into your ' + p.name + ' post.');
+        });
+      });
+    });
+  }
+
+  function renderSocialPanel(){
+    panel.innerHTML =
+      '<div class="soc-note">Compose once, check it against each platform\'s rules, then hand it off. One-click posting isn\'t connected yet — until then, "Copy caption &amp; open" gets each post into the app in two clicks. Your files stay in this browser and are never uploaded.</div>' +
+      '<div id="socPlat" class="soc-plat"></div>' +
+      '<div class="soc-grid">' +
+        '<div><div class="soc-label">Media</div><div id="socMedia"></div>' +
+        '<div class="soc-label" style="margin-top:18px;">Caption</div>' +
+        '<textarea id="socCaption" class="draft-field" rows="6" placeholder="Write your caption…"></textarea>' +
+        '<div id="socCount" class="soc-count"></div><div id="socTags" class="soc-tags"></div></div>' +
+        '<div><div class="soc-label">Caption preview</div><div id="socPreview"></div></div>' +
+      '</div>' +
+      '<div id="socStatus" class="soc-status"></div><div id="socActions" class="add-row"></div>';
+    var ta = document.getElementById('socCaption');
+    ta.value = social.caption;
+    ta.addEventListener('input', function(){ social.caption = ta.value; saveSocialDraft(); socialRenderLight(); });
+    socialRenderHeavy();
+    socialRenderLight();
+  }
+
+  // "post to instagram and tiktok saying …" typed into the chat box.
+  function parseSocialRequest(text){
+    if (!/\b(post|publish|share|upload)\b/i.test(text)) return null;
+    var targets = {
+      instagram: /\b(instagram|insta|ig|reels?)\b/i.test(text),
+      facebook: /\b(facebook|fb)\b/i.test(text),
+      tiktok: /\b(tik ?tok)\b/i.test(text)
+    };
+    var social_ = /\bsocial(?: media)?\b/i.test(text);
+    if (!targets.instagram && !targets.facebook && !targets.tiktok && !social_) return null;
+    if (!targets.instagram && !targets.facebook && !targets.tiktok) targets = {instagram: true, facebook: true, tiktok: false};
+    var m = text.match(/\b(?:saying|caption(?:ed)?|that says|with the caption)\s*:?\s+(.+)$/i) || text.match(/:\s*(.+)$/);
+    var caption = m ? m[1].trim().replace(/^["“]|["”]$/g, '') : '';
+    return {targets: targets, caption: caption};
+  }
+
+  function runSocialRequest(text, req){
+    resetPipeline();
+    setStep(1, text);
+    social.targets = req.targets;
+    if (req.caption) social.caption = capitalize(req.caption);
+    saveSocialDraft();
+    openModule('social');
+    var names = Object.keys(req.targets).filter(function(k){ return req.targets[k]; }).map(function(k){ return SOCIAL[k].name; });
+    setStep(2, 'Opened the Social Posting composer for ' + names.join(', ') + (req.caption ? ' with your caption filled in' : '') + '. Add media, review the checks, then post.');
+    pushLog('Opened social composer for ' + names.join(', ') + '.');
+    panel.scrollIntoView({behavior: 'smooth', block: 'start'});
+  }
+
+  var renderers = {gmail:renderGmailPanel, calendar:renderCalendarPanel, drive:renderDrivePanel, gemini:renderGeminiPanel, autoreply:renderAutoReplyPanel, notifications:renderNotifPanel, social:renderSocialPanel};
 
   function openModule(mod){
     grid.querySelectorAll('.module').forEach(function(m){ m.classList.toggle('open', m.dataset.mod === mod); });
@@ -1422,6 +1690,8 @@
   }
 
   function runFreeText(text){
+    var socialReq = parseSocialRequest(text);
+    if (socialReq) return runSocialRequest(text, socialReq);
     if (/\b(reply|respond)\b/i.test(text)) return runReplyFromText(text);
     var em = parseSendEmail(text);
     if (em) return runSendEmail(text, em);
