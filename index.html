@@ -464,7 +464,7 @@
   async function sendGmailReply(email, replyText, subjectOverride){
     var to = (email.fromFull.match(/<(.+)>/) || [null, email.fromFull])[1];
     var subject = subjectOverride || (email.subject.indexOf('Re:') === 0 ? email.subject : 'Re: ' + email.subject);
-    var raw = 'To: ' + to + '\r\nSubject: ' + subject + '\r\nContent-Type: text/plain; charset="UTF-8"\r\n\r\n' + replyText;
+    var raw = 'To: ' + to + '\r\nSubject: ' + encodeSubject(subject) + '\r\nContent-Type: text/plain; charset="UTF-8"\r\n\r\n' + replyText;
     return gapiFetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
@@ -1038,12 +1038,19 @@
     }, 550);
   }
 
-  async function sendGmailMessage(to, subject, body){
-    var raw = 'To: ' + to + '\r\nSubject: ' + subject + '\r\nContent-Type: text/plain; charset="UTF-8"\r\n\r\n' + body;
+  // Non-ASCII subjects (dashes, accents, other scripts) must be MIME-encoded.
+  function encodeSubject(s){
+    return /^[\x20-\x7E]*$/.test(s) ? s : '=?UTF-8?B?' + btoa(unescape(encodeURIComponent(s))) + '?=';
+  }
+
+  async function sendGmailMessage(to, subject, body, threadId){
+    var raw = 'To: ' + to + '\r\nSubject: ' + encodeSubject(subject) + '\r\nContent-Type: text/plain; charset="UTF-8"\r\n\r\n' + body;
+    var payload = {raw: base64UrlEncode(raw)};
+    if (threadId) payload.threadId = threadId;
     return gapiFetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({raw: base64UrlEncode(raw)})
+      body: JSON.stringify(payload)
     });
   }
 
@@ -1659,26 +1666,126 @@
         ? 'Got the recipient (' + em.label + ') but nothing to base a draft on — opened a blank draft for you to write.'
         : (em.why || ('Drafted an email to ' + em.label + ' with subject "' + em.subject + '".')) + ' Review it before it sends.');
       pushLog('Drafted email to ' + em.label);
-      setTimeout(function(){
-        setStep(3, 'Waiting for you to review and send the draft...');
-        showDraft(em, function(subject, body){
-          setStep(3, 'Draft approved by user.', 'done');
-          setStep(4, 'Sending...');
-          (em.reply ? sendGmailReply(em.reply, body, subject || undefined) : sendGmailMessage(em.to, subject || '(no subject)', body)).then(function(){
-            setStep(4, 'Sent — logged to Notification Center.', 'done');
-            pushNotif((em.reply ? 'Sent reply to ' : 'Sent email to ') + em.to + ' — "' + (subject || '(no subject)') + '"');
-            if (em.reply){ em.reply.replied = true; if (openMod === 'gmail') renderGmailPanel(); }
-          }).catch(function(e){
-            setStep(4, 'Send failed — nothing was sent.');
-            toastError('Send failed: ' + e.message);
-          });
-        }, function(){
-          setStep(3, 'Draft cancelled by user.', 'done');
-          pushNotif('Cancelled draft email to ' + em.to);
-        });
-      }, 500);
+      setTimeout(function(){ reviewAndSend(em); }, 500);
       }
     }, 400);
+  }
+
+  // Shows the editable draft and sends it only after the user presses Send.
+  // onDone fires once the user has sent, cancelled, or the send failed.
+  function reviewAndSend(em, onDone){
+    onDone = onDone || function(){};
+    setStep(3, 'Waiting for you to review and send the draft...');
+    showDraft(em, function(subject, body){
+      setStep(3, 'Draft approved by user.', 'done');
+      setStep(4, 'Sending...');
+      (em.reply ? sendGmailReply(em.reply, body, subject || undefined) : sendGmailMessage(em.to, subject || '(no subject)', body, em.threadId)).then(function(){
+        setStep(4, 'Sent — logged to Notification Center.', 'done');
+        pushNotif((em.reply || em.threadId ? 'Sent reply to ' : 'Sent email to ') + em.to + ' — "' + (subject || '(no subject)') + '"');
+        if (em.reply){ em.reply.replied = true; if (openMod === 'gmail') renderGmailPanel(); }
+        onDone();
+      }).catch(function(e){
+        setStep(4, 'Send failed — nothing was sent.');
+        toastError('Send failed: ' + e.message);
+        onDone();
+      });
+    }, function(){
+      setStep(3, 'Draft cancelled by user.', 'done');
+      pushNotif('Cancelled draft email to ' + em.to);
+      onDone();
+    });
+  }
+
+  // ---- Claude-powered assistant (needs ANTHROPIC_API_KEY on the server) ----
+  function askAssistant(text){
+    return ensureToken().then(function(){
+      return fetch('/api/assistant', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          token: state.google.accessToken,
+          request: text,
+          now: new Date().toString(),
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+          userEmail: state.google.email
+        })
+      });
+    }).then(function(res){
+      if (!res.ok) return res.json().catch(function(){ return {}; }).then(function(j){
+        var err = new Error(j.error || ('status ' + res.status));
+        err.code = j.error;
+        throw err;
+      });
+      return res.json();
+    });
+  }
+
+  function proposalToEmail(p){
+    var known = state.emails.find(function(e){ return p.threadId && e.threadId === p.threadId; });
+    return {
+      to: p.to,
+      label: (known && known.from ? known.from + ' <' + p.to + '>' : p.to),
+      subject: p.subject,
+      body: p.body,
+      blank: false,
+      threadId: p.threadId || '',
+      reply: known || null,
+      why: p.reason || ''
+    };
+  }
+
+  function reviewEventProposal(p, onDone){
+    var start = new Date(p.start), end = new Date(p.end);
+    if (isNaN(start.getTime())){ onDone(); return; }
+    if (isNaN(end.getTime()) || end <= start) end = new Date(start.getTime() + 30 * 60000);
+    var whenText = start.toLocaleDateString([], {weekday:'long', day:'numeric', month:'long'}) + ', ' +
+      start.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'}) + ' – ' + end.toLocaleTimeString([], {hour:'numeric', minute:'2-digit'});
+    setStep(3, 'Waiting for your confirmation...');
+    showModal('CALENDAR', 'Add "' + p.title + '" to your real Google Calendar:\n' + whenText + (p.location ? '\nLocation: ' + p.location : '') + (p.reason ? '\n\n' + p.reason : ''), function(){
+      setStep(3, 'Confirmed by user.', 'done');
+      setStep(4, 'Booking…');
+      createCalendarEvent(p.title, start.toISOString(), end.toISOString()).then(function(ev){
+        state.events.push({id: ev.id, title: p.title, time: start.toLocaleString([], {weekday:'short', hour:'2-digit', minute:'2-digit'})});
+        setStep(4, 'Booked — logged to Notification Center.', 'done');
+        pushNotif('Booked (live) "' + p.title + '" — ' + whenText);
+        if (openMod === 'calendar') renderCalendarPanel();
+        onDone();
+      }).catch(function(e){ toastError('Booking failed: ' + e.message); onDone(); });
+    }, function(){
+      setStep(3, 'Cancelled by user.', 'done');
+      pushNotif('Cancelled event: ' + p.title);
+      onDone();
+    });
+  }
+
+  function processProposals(list){
+    if (!list.length) return;
+    var p = list.shift();
+    var next = function(){ processProposals(list); };
+    if (p.type === 'email') reviewAndSend(proposalToEmail(p), next);
+    else reviewEventProposal(p, next);
+  }
+
+  // Resolves true when the AI handled the request, false when the caller should
+  // fall back to the built-in mode (no key on the server, AI unavailable, etc.).
+  function runAiRequest(text){
+    resetPipeline();
+    setStep(1, text);
+    setStep(2, 'Reading your Gmail, Calendar and Drive as needed…');
+    pushLog('AI request: ' + text);
+    return askAssistant(text).then(function(d){
+      var proposals = d.proposals || [];
+      setStep(2, d.reply + (d.lookups ? '  (looked things up ' + d.lookups + ' time' + (d.lookups === 1 ? '' : 's') + ' in your account)' : ''), proposals.length ? undefined : 'done');
+      pushLog('AI answered' + (proposals.length ? ' with ' + proposals.length + ' proposal(s) for review.' : '.'));
+      if (proposals.length) setTimeout(function(){ processProposals(proposals.slice()); }, 400);
+      return true;
+    }).catch(function(e){
+      if (e.code === 'unauthorized'){
+        setStep(2, 'Your Google session isn\'t valid — click Google Account to reconnect.');
+        return true;
+      }
+      return false;
+    });
   }
 
   function classify(text){
@@ -1689,9 +1796,20 @@
     return 'gemini';
   }
 
+  // Connected: Claude handles the request. If the AI isn't available (no key on
+  // the server, network problem), fall back to the built-in mode below.
   function runFreeText(text){
     var socialReq = parseSocialRequest(text);
     if (socialReq) return runSocialRequest(text, socialReq);
+    if (!state.google.connected) return runLocalRequest(text);
+    runAiRequest(text).then(function(handled){
+      if (handled) return;
+      toastInfo('AI assistant is unavailable right now — using built-in mode.');
+      runLocalRequest(text);
+    });
+  }
+
+  function runLocalRequest(text){
     if (/\b(reply|respond)\b/i.test(text)) return runReplyFromText(text);
     var em = parseSendEmail(text);
     if (em) return runSendEmail(text, em);
