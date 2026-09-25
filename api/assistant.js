@@ -206,9 +206,13 @@ function pickProvider() {
   return ['anthropic', 'groq', 'gemini'].find((p) => has[p]) || null;
 }
 
-function apiError(status) {
-  const err = new Error('provider_' + status);
-  err.status = status;
+// Builds an error carrying the provider's own message (never the API key) so the
+// Vercel logs show WHY a call failed, not just the status code.
+async function apiError(res) {
+  let detail = '';
+  try { detail = clip(await res.text(), 300).replace(/\s+/g, ' '); } catch (e) { /* no body */ }
+  const err = new Error('provider_' + res.status + (detail ? ': ' + detail : ''));
+  err.status = res.status;
   return err;
 }
 
@@ -228,7 +232,7 @@ const ADAPTERS = {
           messages: st.messages,
         }),
       });
-      if (!res.ok) throw apiError(res.status);
+      if (!res.ok) throw await apiError(res);
       const data = await res.json();
       const blocks = data.content || [];
       st.messages.push({ role: 'assistant', content: blocks });
@@ -244,22 +248,36 @@ const ADAPTERS = {
 
   // Groq's free tier (OpenAI-compatible API, open Llama models).
   groq: {
-    model: () => process.env.ASSISTANT_MODEL || process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
+    // Groq changes which models are available to which plans, so try several in order
+    // and remember the first that works. Set ASSISTANT_MODEL to force one.
+    candidates: () => (process.env.ASSISTANT_MODEL || process.env.GROQ_MODEL)
+      ? [process.env.ASSISTANT_MODEL || process.env.GROQ_MODEL]
+      : ['openai/gpt-oss-120b', 'llama-3.3-70b-versatile', 'openai/gpt-oss-20b', 'llama-3.1-8b-instant'],
+    working: null,
     init: (context) => ({ messages: [{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: context }] }),
     async step(st) {
-      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', authorization: 'Bearer ' + process.env.GROQ_API_KEY },
-        body: JSON.stringify({
-          model: this.model(),
-          max_tokens: 2048,
-          temperature: 0.4,
-          messages: st.messages,
-          tools: TOOLS.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.input_schema } })),
-          tool_choice: 'auto',
-        }),
-      });
-      if (!res.ok) throw apiError(res.status);
+      const models = this.working ? [this.working] : this.candidates();
+      let res, lastErr;
+      for (const model of models) {
+        res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', authorization: 'Bearer ' + process.env.GROQ_API_KEY },
+          body: JSON.stringify({
+            model,
+            max_tokens: 2048,
+            temperature: 0.4,
+            messages: st.messages,
+            tools: TOOLS.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.input_schema } })),
+            tool_choice: 'auto',
+          }),
+        });
+        if (res.ok) { this.working = model; break; }
+        lastErr = await apiError(res);
+        console.error('Groq model "' + model + '" failed: ' + lastErr.message);
+        // Only a missing/blocked model is worth trying the next one for.
+        if (![400, 403, 404].includes(res.status)) throw lastErr;
+      }
+      if (!res.ok) throw lastErr;
       const data = await res.json();
       const msg = (data.choices && data.choices[0] && data.choices[0].message) || {};
       st.messages.push(msg);
@@ -292,7 +310,7 @@ const ADAPTERS = {
           generationConfig: { maxOutputTokens: 2048, temperature: 0.4 },
         }),
       });
-      if (!res.ok) throw apiError(res.status);
+      if (!res.ok) throw await apiError(res);
       const data = await res.json();
       const content = data.candidates && data.candidates[0] && data.candidates[0].content;
       const parts = (content && content.parts) || [];
@@ -401,7 +419,7 @@ module.exports = async function handler(req, res) {
       lookups: used.length,
     });
   } catch (e) {
-    console.error('Assistant failed (' + provider + '):', e && e.status ? 'status ' + e.status : (e && e.message));
+    console.error('Assistant failed (' + provider + '):', e && e.message);
     return res.status(502).json({ error: 'ai_unavailable', status: e && e.status, provider });
   }
 };
