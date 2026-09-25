@@ -137,6 +137,15 @@
   .soc-bad{color:var(--red);}
   .soc-plat-item .mini-btn{padding:3px 9px;}
   #socPost:disabled{opacity:0.45;cursor:default;}
+  .soc-conn{border:1px solid var(--line);border-radius:6px;padding:12px 14px;margin-bottom:16px;background:var(--bg);font-size:0.78rem;line-height:1.7;color:var(--ink);}
+  .soc-conn-row{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;}
+  .soc-guide{margin-top:10px;color:var(--dim);}
+  .soc-guide summary{cursor:pointer;color:var(--green);}
+  .soc-guide ol{margin:8px 0 0 18px;padding:0;}
+  .soc-guide li{margin-bottom:6px;}
+  .soc-guide code{color:var(--ink);background:#141a22;padding:1px 5px;border-radius:3px;word-break:break-all;}
+  .soc-guide a{color:var(--green);}
+  .soc-badge-on{color:var(--green);border-color:var(--green);}
 
   .log-line{padding:9px 0;border-bottom:1px dashed var(--line);font-size:0.78rem;color:var(--dim);display:flex;gap:10px;}
   .log-line:last-child{border-bottom:none;}
@@ -823,13 +832,30 @@
     plat.innerHTML = Object.keys(SOCIAL).map(function(k){
       var p = SOCIAL[k];
       return '<div class="soc-plat-item"><label><input type="checkbox" data-plat="' + k + '"' + (social.targets[k] ? ' checked' : '') + '> ' + p.name + '</label>' +
-        '<span class="soc-badge">Not connected</span><button class="mini-btn" data-connect="' + k + '">Connect</button></div>';
+        (k === 'tiktok'
+          ? '<span class="soc-badge">Coming later</span><button class="mini-btn" data-connect="tiktok">Why?</button>'
+          : (metaReady(k)
+              ? '<span class="soc-badge soc-badge-on">Connected</span>'
+              : (META.connected && k === 'instagram'
+                  ? '<span class="soc-badge">No Instagram linked</span>'
+                  : '<span class="soc-badge">Not connected</span><button class="mini-btn" data-connect="' + k + '">Connect</button>'))) + '</div>';
     }).join('') + '<div class="soc-setup" id="socSetup"' + (social.note ? '' : ' hidden') + '>' + escapeHtml(social.note) + '</div>';
     plat.querySelectorAll('[data-plat]').forEach(function(cb){
       cb.addEventListener('change', function(){ social.targets[cb.dataset.plat] = cb.checked; saveSocialDraft(); socialRenderLight(); });
     });
     plat.querySelectorAll('[data-connect]').forEach(function(b){
-      b.addEventListener('click', function(){ social.note = SOCIAL[b.dataset.connect].setup + ' That isn\'t set up yet, so for now use "Copy caption & open" below.'; socialRenderHeavy(); });
+      b.addEventListener('click', function(){
+        if (b.dataset.connect === 'tiktok'){
+          social.note = SOCIAL.tiktok.setup + ' It isn\'t connected yet, so for now use "Copy caption & open TikTok" below.';
+          socialRenderHeavy();
+        } else if (metaAppId()){
+          metaConnect();
+        } else {
+          var conn = document.getElementById('socConn');
+          if (conn) conn.scrollIntoView({behavior: 'smooth', block: 'center'});
+          META.error = 'Enter your Meta App ID first (steps below).'; socialRenderConn();
+        }
+      });
     });
 
     var media = document.getElementById('socMedia');
@@ -887,9 +913,15 @@
     }).join('') : '';
 
     var actions = document.getElementById('socActions');
-    actions.innerHTML = '<button class="btn btn-primary" id="socPost" disabled style="padding:9px 18px;font-size:0.78rem;">Post to selected (connect accounts first)</button>' +
+    var metaTargets = selected.filter(function(k){ return k !== 'tiktok'; });
+    var canPost = !META.busy && metaTargets.length > 0 && metaTargets.every(function(k){ return metaReady(k) && problems[k].length === 0; });
+    var postLabel = META.busy ? 'Posting…'
+      : (!META.connected ? 'Post now (connect Facebook first)'
+        : (metaTargets.length ? 'Post now to ' + metaTargets.map(function(k){ return SOCIAL[k].name; }).join(' & ') : 'Post now (tick Facebook or Instagram)'));
+    actions.innerHTML = '<button class="btn btn-primary" id="socPost"' + (canPost ? '' : ' disabled') + ' style="padding:9px 18px;font-size:0.78rem;">' + postLabel + '</button>' +
       '<button class="mini-btn" id="socCopy">Copy caption</button>' +
       selected.map(function(k){ return '<button class="mini-btn" data-open="' + k + '">Copy caption &amp; open ' + SOCIAL[k].name + '</button>'; }).join('');
+    document.getElementById('socPost').addEventListener('click', metaConfirmAndPost);
     document.getElementById('socCopy').addEventListener('click', function(){
       copyCaption().then(function(ok){
         if (ok) pushNotif('Copied social caption to clipboard.'); else toastError(social.caption.trim() ? 'Couldn\'t copy — select the text and copy it manually.' : 'Write a caption first.');
@@ -907,9 +939,386 @@
     });
   }
 
+  // ---- Facebook + Instagram posting through Meta's official APIs ----
+  // Login uses the Facebook JavaScript SDK in the browser: only your Meta App ID is needed
+  // (it is public, not a secret). Access tokens are kept in memory only. Posting goes
+  // straight from this browser to Meta. Instagram cannot take file uploads, so the media
+  // is first uploaded to your Facebook Page and Instagram fetches it from there.
+  var META = {
+    version: 'v24.0',
+    appIdKey: 'wa_meta_app_id',
+    configKey: 'wa_meta_config_id',
+    sdkPromise: null,
+    connected: false,
+    userName: '',
+    pages: [],
+    pageId: null,
+    busy: false,
+    error: '',
+    results: [],
+    progress: ''
+  };
+  var META_SCOPES = 'pages_show_list,pages_read_engagement,pages_manage_posts,instagram_basic,instagram_content_publish,business_management';
+
+  function metaStore(key, val){
+    try {
+      if (val === undefined) return localStorage.getItem(key) || '';
+      if (val) localStorage.setItem(key, val); else localStorage.removeItem(key);
+    } catch(e){}
+    return val || '';
+  }
+  function metaAppId(){ return metaStore(META.appIdKey); }
+  function metaPage(){
+    return META.pages.find(function(p){ return p.id === META.pageId; }) || null;
+  }
+
+  function loadFbSdk(appId){
+    if (META.sdkPromise) return META.sdkPromise.then(function(){
+      if (META.sdkAppId !== appId){ FB.init({appId: appId, cookie: false, xfbml: false, version: META.version}); META.sdkAppId = appId; }
+    });
+    META.sdkPromise = new Promise(function(resolve, reject){
+      window.fbAsyncInit = function(){
+        try {
+          FB.init({appId: appId, cookie: false, xfbml: false, version: META.version});
+          META.sdkAppId = appId;
+          resolve();
+        } catch(e){ reject(e); }
+      };
+      var s = document.createElement('script');
+      s.src = 'https://connect.facebook.net/en_US/sdk.js';
+      s.async = true;
+      s.onerror = function(){ META.sdkPromise = null; reject(new Error('Couldn\'t load the Facebook login script — check your connection or ad blocker.')); };
+      document.head.appendChild(s);
+    });
+    return META.sdkPromise;
+  }
+
+  function metaQuery(params){
+    return Object.keys(params).filter(function(k){ return params[k] !== undefined && params[k] !== null; }).map(function(k){
+      return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]);
+    }).join('&');
+  }
+
+  function metaError(err){
+    err = err || {};
+    var e = new Error(err.message || 'Meta API error');
+    e.code = err.code;
+    if (err.code === 190) e.message = 'Your Facebook login expired — click Connect again.';
+    else if (err.code === 10 || err.code === 200 || err.code === 283) e.message = 'Meta says this account hasn\'t granted (or the app doesn\'t have) the needed permission: ' + (err.message || '');
+    return e;
+  }
+
+  // method GET: params go in the query string. POST: params is a plain object
+  // (form-encoded) or a FormData (for file uploads).
+  function graphCall(method, path, params, host){
+    var url = (host || 'https://graph.facebook.com') + '/' + META.version + path;
+    var opts = {method: method};
+    if (method === 'GET'){
+      url += (url.indexOf('?') === -1 ? '?' : '&') + metaQuery(params || {});
+    } else if (typeof FormData !== 'undefined' && params instanceof FormData){
+      opts.body = params;
+    } else {
+      opts.headers = {'Content-Type': 'application/x-www-form-urlencoded'};
+      opts.body = metaQuery(params || {});
+    }
+    return fetch(url, opts).then(function(res){
+      return res.json().catch(function(){ return {}; }).then(function(j){
+        if (!res.ok || j.error) throw metaError(j.error || {message: 'Meta returned status ' + res.status});
+        return j;
+      });
+    });
+  }
+
+  function metaLoadPages(userToken){
+    return graphCall('GET', '/me/accounts', {
+      fields: 'id,name,access_token,instagram_business_account{id,username}',
+      limit: 25,
+      access_token: userToken
+    }).then(function(j){
+      META.pages = (j.data || []).map(function(p){
+        return {id: p.id, name: p.name, token: p.access_token,
+          igId: p.instagram_business_account ? p.instagram_business_account.id : '',
+          igName: p.instagram_business_account ? p.instagram_business_account.username : ''};
+      });
+      if (!META.pages.length) throw new Error('No Facebook Pages found for this login. Pages you manage must be selected during login — click Connect again and tick your Page.');
+      if (!META.pageId || !metaPage()) META.pageId = META.pages[0].id;
+    });
+  }
+
+  function metaAfterLogin(resp){
+    var token = resp && resp.authResponse && resp.authResponse.accessToken;
+    if (!token) return Promise.reject(new Error('Facebook login was cancelled or didn\'t complete. If a popup was blocked, allow popups for this site and click Connect again.'));
+    return graphCall('GET', '/me', {fields: 'name', access_token: token}).then(function(me){
+      META.userName = me.name || '';
+      return metaLoadPages(token);
+    }).then(function(){
+      META.connected = true;
+      META.error = '';
+      pushNotif('Connected Facebook' + (META.userName ? ' as ' + META.userName : '') + ' — ' + META.pages.length + ' Page' + (META.pages.length === 1 ? '' : 's') + ' found.');
+    });
+  }
+
+  function metaConnect(){
+    var appId = metaAppId();
+    if (!appId){ META.error = 'Enter your Meta App ID first.'; socialRenderConn(); return; }
+    META.error = ''; META.busy = true; socialRenderConn();
+    // FB.login must run straight from the click, so the SDK has to be loaded already.
+    loadFbSdk(appId).then(function(){
+      var cfg = metaStore(META.configKey);
+      var opts = cfg ? {config_id: cfg, response_type: 'token'} : {scope: META.scopes || META_SCOPES, return_scopes: true};
+      FB.login(function(resp){
+        metaAfterLogin(resp).catch(function(e){ META.error = e.message; META.connected = false; }).then(function(){
+          META.busy = false; socialRenderConn(); socialRenderHeavy(); socialRenderLight();
+        });
+      }, opts);
+    }).catch(function(e){ META.error = e.message; META.busy = false; socialRenderConn(); });
+  }
+
+  function metaDisconnect(){
+    try { if (window.FB) FB.logout(function(){}); } catch(e){}
+    META.connected = false; META.pages = []; META.pageId = null; META.userName = ''; META.results = []; META.progress = '';
+    socialRenderConn(); socialRenderHeavy(); socialRenderLight();
+  }
+
+  // Restores an existing Facebook session silently when the panel opens.
+  function metaRestore(){
+    var appId = metaAppId();
+    if (!appId || META.connected || META.busy) return;
+    loadFbSdk(appId).then(function(){
+      FB.getLoginStatus(function(resp){
+        if (resp && resp.status === 'connected') metaAfterLogin(resp).then(function(){
+          socialRenderConn(); socialRenderHeavy(); socialRenderLight();
+        }).catch(function(){});
+      });
+    }).catch(function(){});
+  }
+
+  function metaReady(k){
+    var pg = metaPage();
+    if (!META.connected || !pg) return false;
+    if (k === 'instagram') return !!pg.igId;
+    return k === 'facebook';
+  }
+
+  // ---- Posting ----
+  function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+
+  function metaFormWith(fields, file, fileField){
+    var fd = new FormData();
+    Object.keys(fields).forEach(function(k){ if (fields[k] !== undefined && fields[k] !== null) fd.append(k, fields[k]); });
+    fd.append(fileField, file, file.name);
+    return fd;
+  }
+
+  function fbUploadPhoto(pg, file, published, caption){
+    return graphCall('POST', '/' + pg.id + '/photos', metaFormWith({
+      access_token: pg.token, published: published ? 'true' : 'false', caption: published ? caption : undefined
+    }, file, 'source'));
+  }
+
+  function fbUploadVideo(pg, file, published, caption){
+    return graphCall('POST', '/' + pg.id + '/videos', metaFormWith({
+      access_token: pg.token, published: published ? 'true' : 'false', description: published ? caption : undefined
+    }, file, 'source'), 'https://graph-video.facebook.com');
+  }
+
+  function fbWaitVideoSource(pg, videoId, log){
+    var tries = 0;
+    function poll(){
+      tries++;
+      return graphCall('GET', '/' + videoId, {fields: 'status,source', access_token: pg.token}).then(function(j){
+        var st = j.status && j.status.video_status;
+        if (st === 'error') throw new Error('Facebook couldn\'t process the video.');
+        if (j.source && (!st || st === 'ready')) return j.source;
+        if (tries >= 40) throw new Error('Facebook is still processing the video — try again in a few minutes.');
+        log('Facebook is processing the video…');
+        return sleep(4000).then(poll);
+      });
+    }
+    return poll();
+  }
+
+  function igCreateAndPublish(pg, fields, log){
+    fields.access_token = pg.token;
+    return graphCall('POST', '/' + pg.igId + '/media', fields).then(function(c){
+      var tries = 0;
+      function poll(){
+        tries++;
+        return graphCall('GET', '/' + c.id, {fields: 'status_code', access_token: pg.token}).then(function(j){
+          if (j.status_code === 'FINISHED' || (!j.status_code && tries > 1)) return;
+          if (j.status_code === 'ERROR' || j.status_code === 'EXPIRED') throw new Error('Instagram rejected the media (' + j.status_code + '). Check the size and format, e.g. JPEG images, MP4 video 3–90 seconds.');
+          if (tries >= 40) throw new Error('Instagram is still processing the media — try again shortly.');
+          log('Instagram is processing the media…');
+          return sleep(3000).then(poll);
+        });
+      }
+      return poll().then(function(){
+        log('Publishing to Instagram…');
+        return graphCall('POST', '/' + pg.igId + '/media_publish', {creation_id: c.id, access_token: pg.token});
+      });
+    }).then(function(pub){
+      return graphCall('GET', '/' + pub.id, {fields: 'permalink', access_token: pg.token}).then(function(j){
+        return j.permalink || '';
+      }, function(){ return ''; });
+    });
+  }
+
+  // Posts to the selected Facebook / Instagram targets. Resolves to a list of
+  // {platform, ok, link, error}; one platform failing doesn't stop the other.
+  function metaPostNow(log){
+    var pg = metaPage();
+    var wantFb = social.targets.facebook, wantIg = social.targets.instagram;
+    var caption = social.caption, file = social.file, isVideo = social.kind === 'video';
+    var results = [];
+    var shared = {};
+
+    var prep = Promise.resolve();
+    if (file && !isVideo){
+      // One unpublished upload serves both: Facebook attaches it to a post, Instagram fetches its URL.
+      prep = (function(){
+        log('Uploading the image to your Facebook Page…');
+        return fbUploadPhoto(pg, file, !wantIg, caption).then(function(up){
+          shared.photoId = up.id; shared.fbPostId = up.post_id || '';
+          if (!wantIg) return;
+          return graphCall('GET', '/' + up.id, {fields: 'images', access_token: pg.token}).then(function(j){
+            shared.imageUrl = j.images && j.images[0] && j.images[0].source;
+            if (!shared.imageUrl) throw new Error('Couldn\'t get a public link for the image from Facebook.');
+          });
+        });
+      })();
+    } else if (file && isVideo){
+      prep = (function(){
+        log('Uploading the video to your Facebook Page (this can take a while)…');
+        return fbUploadVideo(pg, file, wantFb, caption).then(function(up){
+          shared.videoId = up.id;
+          if (wantFb) shared.fbPostId = up.id;
+          if (!wantIg) return;
+          return fbWaitVideoSource(pg, up.id, log).then(function(src){ shared.videoUrl = src; });
+        });
+      })();
+    }
+
+    return prep.then(function(){
+      var jobs = [];
+      if (wantFb){
+        jobs.push((function(){
+          var p;
+          if (!file){
+            log('Posting to Facebook…');
+            p = graphCall('POST', '/' + pg.id + '/feed', {message: caption, access_token: pg.token}).then(function(j){ return j.id; });
+          } else if (isVideo){
+            p = Promise.resolve(shared.videoId);
+          } else if (wantIg){
+            log('Posting to Facebook…');
+            p = graphCall('POST', '/' + pg.id + '/feed', {
+              message: caption, access_token: pg.token, attached_media: JSON.stringify([{media_fbid: shared.photoId}])
+            }).then(function(j){ return j.id; });
+          } else {
+            p = Promise.resolve(shared.fbPostId || shared.photoId);
+          }
+          return p.then(function(id){
+            results.push({platform: 'Facebook', ok: true, link: isVideo && file ? 'https://www.facebook.com/' + pg.id + '/videos/' + id : 'https://www.facebook.com/' + id});
+          }, function(e){ results.push({platform: 'Facebook', ok: false, error: e.message}); });
+        })());
+      }
+      if (wantIg){
+        jobs.push((function(){
+          var fields = isVideo
+            ? {media_type: 'REELS', video_url: shared.videoUrl, caption: caption, share_to_feed: 'true'}
+            : {image_url: shared.imageUrl, caption: caption};
+          return igCreateAndPublish(pg, fields, log).then(function(link){
+            results.push({platform: 'Instagram', ok: true, link: link});
+          }, function(e){ results.push({platform: 'Instagram', ok: false, error: e.message}); });
+        })());
+      }
+      return Promise.all(jobs).then(function(){ return results; });
+    });
+  }
+
+  function metaConfirmAndPost(){
+    var pg = metaPage();
+    if (!pg || META.busy) return;
+    var names = [];
+    if (social.targets.facebook) names.push('Facebook Page "' + pg.name + '"');
+    if (social.targets.instagram) names.push('Instagram @' + (pg.igName || pg.igId));
+    var skip = social.targets.tiktok ? '\n\n(TikTok isn\'t connected and will be skipped — use "Copy caption & open TikTok".)' : '';
+    var text = 'Post this for real to ' + names.join(' and ') + '?\n\n' +
+      (social.file ? 'Media: ' + social.file.name + ' (' + social.meta + ')\n' : 'No media (text only)\n') +
+      'Caption: ' + (social.caption.trim() ? '"' + social.caption.slice(0, 160) + (social.caption.length > 160 ? '…' : '') + '"' : '(none)') +
+      '\n\nThis publishes publicly and can\'t be undone from here.' + skip;
+    showModal('SOCIAL', text, function(){
+      META.busy = true; META.results = []; META.progress = 'Starting…'; socialRenderProgress(); socialRenderLight();
+      var log = function(m){ META.progress = m; socialRenderProgress(); };
+      metaPostNow(log).then(function(results){
+        META.results = results;
+        results.forEach(function(r){
+          pushNotif(r.ok ? 'Posted to ' + r.platform + (r.link ? ' — ' + r.link : '') : 'Failed to post to ' + r.platform + ': ' + r.error);
+        });
+      }).catch(function(e){
+        META.results = [{platform: 'Post', ok: false, error: e.message}];
+        pushNotif('Social post failed: ' + e.message);
+      }).then(function(){
+        META.busy = false; META.progress = ''; socialRenderProgress(); socialRenderLight();
+      });
+    }, function(){ pushNotif('Cancelled social post.'); });
+  }
+
+  function socialRenderProgress(){
+    var el = document.getElementById('socProgress');
+    if (!el) return;
+    el.innerHTML = (META.progress ? '<div class="soc-hint">' + escapeHtml(META.progress) + '</div>' : '') +
+      META.results.map(function(r){
+        return r.ok
+          ? '<div class="soc-ok"><strong>' + escapeHtml(r.platform) + ':</strong> posted' + (r.link ? ' — <a href="' + escapeHtml(r.link) + '" target="_blank" rel="noopener" style="color:inherit;">view post</a>' : '') + '.</div>'
+          : '<div class="soc-bad"><strong>' + escapeHtml(r.platform) + ':</strong> failed — ' + escapeHtml(r.error) + '</div>';
+      }).join('');
+  }
+
+  function socialRenderConn(){
+    var el = document.getElementById('socConn');
+    if (!el) return;
+    var appId = metaAppId();
+    var html;
+    if (META.connected){
+      var pg = metaPage();
+      html = '<div class="soc-conn-row"><span class="soc-ok">Connected to Facebook' + (META.userName ? ' as ' + escapeHtml(META.userName) : '') + '.</span>' +
+        (META.pages.length > 1 ? ' <label>Page: <select id="socPageSel" class="draft-field" style="width:auto;padding:4px 8px;">' +
+          META.pages.map(function(p){ return '<option value="' + escapeHtml(p.id) + '"' + (p.id === META.pageId ? ' selected' : '') + '>' + escapeHtml(p.name) + '</option>'; }).join('') + '</select></label>'
+          : ' Page: <strong>' + escapeHtml(pg ? pg.name : '') + '</strong>.') +
+        ' ' + (pg && pg.igId ? 'Instagram: <strong>@' + escapeHtml(pg.igName || pg.igId) + '</strong>.' : '<span class="soc-bad">No Instagram Business/Creator account is linked to this Page, so Instagram posting is unavailable.</span>') +
+        ' <button class="mini-btn" id="socDisc">Disconnect</button></div>';
+    } else {
+      html = '<div class="soc-conn-row"><label>Meta App ID: <input id="socAppId" class="draft-field" style="width:210px;padding:5px 8px;" placeholder="e.g. 1234567890123456" value="' + escapeHtml(appId) + '"></label> ' +
+        '<button class="btn btn-primary" id="socConnect" style="padding:7px 16px;font-size:0.76rem;"' + (META.busy ? ' disabled' : '') + '>' + (META.busy ? 'Connecting…' : 'Connect Facebook &amp; Instagram') + '</button></div>' +
+        (META.error ? '<div class="soc-bad" style="margin-top:8px;">' + escapeHtml(META.error) + '</div>' : '') +
+        '<details class="soc-guide"><summary>How to get a Meta App ID (one-time setup)</summary><ol>' +
+        '<li>Go to <a href="https://developers.facebook.com/apps/" target="_blank" rel="noopener">developers.facebook.com/apps</a> and click <strong>Create app</strong>. Choose the use case for managing Pages / posting, and keep the app in <strong>Development mode</strong>.</li>' +
+        '<li>Add the products <strong>Facebook Login</strong> and the Instagram API (content publishing) to the app.</li>' +
+        '<li>In <strong>App settings → Basic</strong>: add <code>workspace-assistent.vercel.app</code> as an App Domain; set the Privacy Policy URL to <code>https://workspace-assistent.vercel.app/privacy.html</code> and Terms to <code>https://workspace-assistent.vercel.app/terms.html</code>. Copy the <strong>App ID</strong> shown at the top (not the App Secret).</li>' +
+        '<li>In <strong>Facebook Login → Settings</strong>: turn on Login with the JavaScript SDK and add <code>https://workspace-assistent.vercel.app/</code> under Allowed Domains for the JavaScript SDK (and as a Valid OAuth Redirect URI if asked).</li>' +
+        '<li>Make sure your Instagram account is a <strong>Business or Creator</strong> account linked to your Facebook Page, and that you are an admin/developer of the app. While the app is in Development mode, only you (and people you add as testers) can use it.</li>' +
+        '<li>Paste the App ID above and click Connect. Tick your Page and Instagram account when Facebook asks. Meta changes its screens often, so names may differ slightly.</li></ol>' +
+        '<div class="soc-hint" style="margin-top:6px;">If your app uses "Facebook Login for Business", also paste its Configuration ID: <input id="socCfgId" class="draft-field" style="width:170px;padding:4px 8px;" value="' + escapeHtml(metaStore(META.configKey)) + '"></div></details>';
+    }
+    el.innerHTML = html;
+    var c = document.getElementById('socConnect');
+    if (c) c.addEventListener('click', function(){
+      metaStore(META.appIdKey, document.getElementById('socAppId').value.trim().replace(/\D/g, ''));
+      var cfg = document.getElementById('socCfgId');
+      if (cfg) metaStore(META.configKey, cfg.value.trim().replace(/\D/g, ''));
+      // A different App ID needs a fresh SDK; only reload when it changed.
+      metaConnect();
+    });
+    var d = document.getElementById('socDisc');
+    if (d) d.addEventListener('click', metaDisconnect);
+    var sel = document.getElementById('socPageSel');
+    if (sel) sel.addEventListener('change', function(){ META.pageId = sel.value; socialRenderConn(); socialRenderLight(); });
+  }
+
   function renderSocialPanel(){
     panel.innerHTML =
-      '<div class="soc-note">Compose once, check it against each platform\'s rules, then hand it off. One-click posting isn\'t connected yet — until then, "Copy caption &amp; open" gets each post into the app in two clicks. Your files stay in this browser and are never uploaded.</div>' +
+      '<div class="soc-note">Compose once, check it against each platform\'s rules, then post. Facebook and Instagram can post directly once you connect them below. TikTok isn\'t connected yet — use "Copy caption &amp; open TikTok". A file is only uploaded (to your own Facebook Page, via Meta) when you confirm a real post.</div>' +
+      '<div id="socConn" class="soc-conn"></div>' +
       '<div id="socPlat" class="soc-plat"></div>' +
       '<div class="soc-grid">' +
         '<div><div class="soc-label">Media</div><div id="socMedia"></div>' +
@@ -918,12 +1327,15 @@
         '<div id="socCount" class="soc-count"></div><div id="socTags" class="soc-tags"></div></div>' +
         '<div><div class="soc-label">Caption preview</div><div id="socPreview"></div></div>' +
       '</div>' +
-      '<div id="socStatus" class="soc-status"></div><div id="socActions" class="add-row"></div>';
+      '<div id="socStatus" class="soc-status"></div><div id="socActions" class="add-row"></div><div id="socProgress" class="soc-status"></div>';
     var ta = document.getElementById('socCaption');
     ta.value = social.caption;
     ta.addEventListener('input', function(){ social.caption = ta.value; saveSocialDraft(); socialRenderLight(); });
+    socialRenderConn();
     socialRenderHeavy();
     socialRenderLight();
+    socialRenderProgress();
+    metaRestore();
   }
 
   // "post to instagram and tiktok saying …" typed into the chat box.
