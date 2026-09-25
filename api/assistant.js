@@ -1,11 +1,11 @@
-// AI assistant for Workspace Assistant, powered by Anthropic's Claude API.
+// AI assistant for Workspace Assistant. Works with Anthropic (paid), Groq (free tier) or
+// Google Gemini (free tier): whichever API key is set on the server.
 // The browser sends the user's request plus their Google access token. This function
 // verifies the token, lets Claude look things up in the user's own Gmail / Calendar /
 // Drive (read-only), and returns Claude's answer plus any emails or calendar events it
 // PROPOSES. Nothing is sent or booked here: the browser shows each proposal to the user,
 // who approves it first. Stateless: nothing is stored or logged.
 const GOOGLE_CLIENT_ID = '118202641770-jjr3c788jvgo5sf9a3oib8s9a5ltjr8u.apps.googleusercontent.com';
-const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-5';
 const MAX_ITERATIONS = 8;
 const MAX_REQUEST = 2000;
 const MAX_PROPOSALS = 4;
@@ -193,38 +193,135 @@ async function runReadTool(name, input, token) {
   throw new Error('unknown tool');
 }
 
-async function callClaude(messages) {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-api-key': process.env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: 2048,
-      system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
-      tools: TOOLS,
-      messages,
-    }),
-  });
-  if (!res.ok) {
-    const err = new Error('anthropic_' + res.status);
-    err.status = res.status;
-    throw err;
-  }
-  return res.json();
+// ---- AI providers. The first key found is used (or set AI_PROVIDER to choose). ----
+// Each adapter turns the same conversation into that provider's tool-calling format.
+function pickProvider() {
+  const forced = String(process.env.AI_PROVIDER || '').toLowerCase();
+  const has = {
+    anthropic: !!process.env.ANTHROPIC_API_KEY,
+    groq: !!process.env.GROQ_API_KEY,
+    gemini: !!process.env.GEMINI_API_KEY,
+  };
+  if (forced && has[forced]) return forced;
+  return ['anthropic', 'groq', 'gemini'].find((p) => has[p]) || null;
 }
+
+function apiError(status) {
+  const err = new Error('provider_' + status);
+  err.status = status;
+  return err;
+}
+
+const ADAPTERS = {
+  anthropic: {
+    model: () => process.env.ASSISTANT_MODEL || process.env.ANTHROPIC_MODEL || 'claude-sonnet-5',
+    init: (context) => ({ messages: [{ role: 'user', content: context }] }),
+    async step(st) {
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({
+          model: this.model(),
+          max_tokens: 2048,
+          system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
+          tools: TOOLS,
+          messages: st.messages,
+        }),
+      });
+      if (!res.ok) throw apiError(res.status);
+      const data = await res.json();
+      const blocks = data.content || [];
+      st.messages.push({ role: 'assistant', content: blocks });
+      return {
+        text: blocks.filter((b) => b.type === 'text').map((b) => b.text).join('\n').trim(),
+        calls: data.stop_reason === 'tool_use' ? blocks.filter((b) => b.type === 'tool_use').map((b) => ({ id: b.id, name: b.name, input: b.input || {} })) : [],
+      };
+    },
+    addResults(st, results) {
+      st.messages.push({ role: 'user', content: results.map((r) => ({ type: 'tool_result', tool_use_id: r.id, content: r.content, is_error: r.isError })) });
+    },
+  },
+
+  // Groq's free tier (OpenAI-compatible API, open Llama models).
+  groq: {
+    model: () => process.env.ASSISTANT_MODEL || process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
+    init: (context) => ({ messages: [{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: context }] }),
+    async step(st) {
+      const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer ' + process.env.GROQ_API_KEY },
+        body: JSON.stringify({
+          model: this.model(),
+          max_tokens: 2048,
+          temperature: 0.4,
+          messages: st.messages,
+          tools: TOOLS.map((t) => ({ type: 'function', function: { name: t.name, description: t.description, parameters: t.input_schema } })),
+          tool_choice: 'auto',
+        }),
+      });
+      if (!res.ok) throw apiError(res.status);
+      const data = await res.json();
+      const msg = (data.choices && data.choices[0] && data.choices[0].message) || {};
+      st.messages.push(msg);
+      return {
+        text: String(msg.content || '').trim(),
+        calls: (msg.tool_calls || []).map((c) => {
+          let input = {};
+          try { input = JSON.parse(c.function.arguments || '{}'); } catch (e) { /* bad JSON from the model: treated as empty input */ }
+          return { id: c.id, name: c.function.name, input };
+        }),
+      };
+    },
+    addResults(st, results) {
+      results.forEach((r) => st.messages.push({ role: 'tool', tool_call_id: r.id, content: r.content }));
+    },
+  },
+
+  // Google Gemini's free tier (AI Studio key).
+  gemini: {
+    model: () => process.env.ASSISTANT_MODEL || process.env.GEMINI_MODEL || 'gemini-2.5-flash',
+    init: (context) => ({ contents: [{ role: 'user', parts: [{ text: context }] }] }),
+    async step(st) {
+      const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(this.model()) + ':generateContent', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+          contents: st.contents,
+          tools: [{ functionDeclarations: TOOLS.map((t) => ({ name: t.name, description: t.description, parameters: t.input_schema })) }],
+          generationConfig: { maxOutputTokens: 2048, temperature: 0.4 },
+        }),
+      });
+      if (!res.ok) throw apiError(res.status);
+      const data = await res.json();
+      const content = data.candidates && data.candidates[0] && data.candidates[0].content;
+      const parts = (content && content.parts) || [];
+      st.contents.push({ role: 'model', parts });
+      st.lastCalls = parts.filter((p) => p.functionCall).map((p, i) => ({ id: 'g' + i, name: p.functionCall.name, input: p.functionCall.args || {} }));
+      return {
+        text: parts.filter((p) => p.text && !p.thought).map((p) => p.text).join('\n').trim(),
+        calls: st.lastCalls,
+      };
+    },
+    addResults(st, results) {
+      st.contents.push({
+        role: 'user',
+        parts: results.map((r, i) => ({ functionResponse: { name: st.lastCalls[i].name, response: { result: r.content } } })),
+      });
+    },
+  },
+};
 
 module.exports = async function handler(req, res) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', 'POST');
     return res.status(405).json({ error: 'method_not_allowed' });
   }
-  if (!process.env.ANTHROPIC_API_KEY) {
+  const provider = pickProvider();
+  if (!provider) {
     return res.status(503).json({ error: 'not_configured' });
   }
+  const adapter = ADAPTERS[provider];
 
   const body = req.body || {};
   const { token, request, now, timezone, userEmail } = body;
@@ -240,34 +337,30 @@ module.exports = async function handler(req, res) {
     return res.status(502).json({ error: 'token_check_failed' });
   }
 
-  const context = JSON.stringify({
+  const state = adapter.init(JSON.stringify({
     request: clip(request, MAX_REQUEST),
     myEmail: clip(userEmail, 200),
     now: clip(now, 60),
     timezone: clip(timezone, 60),
-  });
-  const messages = [{ role: 'user', content: context }];
+  }));
   const proposals = [];
   const used = [];
 
   try {
     let final = '';
     for (let i = 0; i < MAX_ITERATIONS; i++) {
-      const data = await callClaude(messages);
-      const blocks = data.content || [];
-      messages.push({ role: 'assistant', content: blocks });
-      const toolUses = blocks.filter((b) => b.type === 'tool_use');
-      if (data.stop_reason !== 'tool_use' || !toolUses.length) {
-        final = blocks.filter((b) => b.type === 'text').map((b) => b.text).join('\n').trim();
+      const turn = await adapter.step(state);
+      if (!turn.calls.length) {
+        final = turn.text;
         break;
       }
       const results = [];
-      for (const tu of toolUses) {
+      for (const call of turn.calls) {
         let content;
         let isError = false;
         try {
-          if (tu.name === 'propose_send_email') {
-            const inp = tu.input || {};
+          if (call.name === 'propose_send_email') {
+            const inp = call.input;
             if (proposals.filter((p) => p.type === 'email').length >= MAX_PROPOSALS || !/^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/.test(String(inp.to || '').trim())) {
               content = 'Not queued: needs one valid recipient email address.';
               isError = true;
@@ -278,8 +371,8 @@ module.exports = async function handler(req, res) {
               });
               content = "Queued for the user's review. It has NOT been sent. The user will edit and approve it.";
             }
-          } else if (tu.name === 'propose_calendar_event') {
-            const inp = tu.input || {};
+          } else if (call.name === 'propose_calendar_event') {
+            const inp = call.input;
             if (isNaN(new Date(inp.start).getTime()) || proposals.filter((p) => p.type === 'event').length >= MAX_PROPOSALS) {
               content = 'Not queued: start must be a valid local date-time like 2026-09-24T15:00:00.';
               isError = true;
@@ -291,24 +384,24 @@ module.exports = async function handler(req, res) {
               content = "Queued for the user's approval. It has NOT been created yet.";
             }
           } else {
-            used.push(tu.name);
-            content = JSON.stringify(await runReadTool(tu.name, tu.input || {}, token));
+            used.push(call.name);
+            content = JSON.stringify(await runReadTool(call.name, call.input, token));
           }
         } catch (e) {
           content = 'Tool failed: ' + (e && e.message ? e.message : 'error');
           isError = true;
         }
-        results.push({ type: 'tool_result', tool_use_id: tu.id, content, is_error: isError });
+        results.push({ id: call.id, content, isError });
       }
-      messages.push({ role: 'user', content: results });
+      adapter.addResults(state, results);
     }
     return res.status(200).json({
-      reply: clip(final || 'Done.', 1500),
+      reply: clip(final || (proposals.length ? 'I prepared this for your review.' : 'Done.'), 1500),
       proposals,
       lookups: used.length,
     });
   } catch (e) {
-    console.error('Assistant failed:', e && e.status ? 'anthropic status ' + e.status : (e && e.message));
-    return res.status(502).json({ error: 'ai_unavailable', status: e && e.status });
+    console.error('Assistant failed (' + provider + '):', e && e.status ? 'status ' + e.status : (e && e.message));
+    return res.status(502).json({ error: 'ai_unavailable', status: e && e.status, provider });
   }
 };
